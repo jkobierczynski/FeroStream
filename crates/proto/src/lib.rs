@@ -47,6 +47,10 @@ pub const MAX_WINDOW_SIDE: u16 = 8192;
 /// Largest string (a title, a program argument, an error), in bytes.
 pub const MAX_STRING: usize = 16 * 1024;
 
+/// Lowest and highest screen DPI in [`Message::Start`] (100 % to 500 %).
+pub const MIN_DPI: u16 = 96;
+pub const MAX_DPI: u16 = 480;
+
 /// Most program arguments in [`Message::Start`].
 pub const MAX_ARGS: usize = 256;
 
@@ -73,10 +77,13 @@ pub enum Message {
 
     // ----- Client to agent -----
     /// Starts a program. `width` x `height` is the size of the virtual
-    /// screen the windows live on (the client's desktop, usually).
+    /// screen the windows live on (the client's desktop, usually); `dpi` is
+    /// the client screen's resolution (96 = 100 %, 144 = 150 %), so programs
+    /// draw text and widgets at the size the user expects.
     Start {
         width: u16,
         height: u16,
+        dpi: u16,
         argv: Vec<String>,
     },
     /// The pointer is at `x`,`y` in `window`'s coordinates.
@@ -189,10 +196,12 @@ impl Message {
             Message::Start {
                 width,
                 height,
+                dpi,
                 argv,
             } => {
                 w.u16(*width);
                 w.u16(*height);
+                w.u16(*dpi);
                 w.u32(argv.len() as u32);
                 for a in argv {
                     w.str(a);
@@ -312,6 +321,10 @@ impl Message {
             16 => {
                 let width = r.side()?;
                 let height = r.side()?;
+                let dpi = r.u16()?;
+                if !(MIN_DPI..=MAX_DPI).contains(&dpi) {
+                    return Err(Error::Invalid("DPI"));
+                }
                 let n = r.u32()? as usize;
                 if n == 0 || n > MAX_ARGS {
                     return Err(Error::Invalid("argument count"));
@@ -323,6 +336,7 @@ impl Message {
                 Message::Start {
                     width,
                     height,
+                    dpi,
                     argv,
                 }
             }
@@ -632,6 +646,7 @@ mod tests {
             Message::Start {
                 width: 1920,
                 height: 1080,
+                dpi: 144,
                 argv: vec!["xterm".into(), "-e".into(), "top".into()],
             },
             Message::PointerMove {

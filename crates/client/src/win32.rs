@@ -30,8 +30,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
-    SetProcessDpiAwarenessContext,
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
+    GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, MAPVK_VK_TO_CHAR, MapVirtualKeyW, ReleaseCapture, SetCapture,
@@ -213,6 +213,9 @@ pub fn run(options: Options) -> ExitCode {
     link.send(Message::Start {
         width: side(vw),
         height: side(vh),
+        // The primary screen's scaling; the remote display has one DPI.
+        dpi: (unsafe { GetDpiForSystem() } as u16)
+            .clamp(ferostream_proto::MIN_DPI, ferostream_proto::MAX_DPI),
         argv: options.program.clone(),
     });
 

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use ferostream_proto::{FrameReader, Message, PREAMBLE, VERSION};
 
+use crate::scale;
 use crate::session::Session;
 use crate::xserver::XServer;
 
@@ -94,7 +95,7 @@ fn run() -> Result<i32, String> {
     out.flush().map_err(|e| e.to_string())?;
 
     let mut reader = FrameReader::new();
-    let (width, height, argv) = {
+    let (width, height, dpi, argv) = {
         let mut input = std::io::stdin().lock();
         match read_message(&mut input, &mut reader)? {
             Some(Message::Hello { version, .. }) if version == VERSION => {}
@@ -111,15 +112,16 @@ fn run() -> Result<i32, String> {
             Some(Message::Start {
                 width,
                 height,
+                dpi,
                 argv,
-            }) => (width, height, argv),
+            }) => (width, height, dpi, argv),
             Some(_) => return fail(&mut out, "expected Start"),
             None => return Ok(0),
         }
     };
 
     let running = Arc::new(Mutex::new(Running::default()));
-    let mut xs = match XServer::start(width, height) {
+    let mut xs = match XServer::start(width, height, dpi) {
         Ok(x) => x,
         Err(e) => return fail(&mut out, &e),
     };
@@ -130,6 +132,10 @@ fn run() -> Result<i32, String> {
             return fail(&mut out, &e);
         }
     };
+    if let Err(e) = scale::apply_resources(&conn, screen, dpi) {
+        xs.stop();
+        return fail(&mut out, &e);
+    }
     let display = format!(":{}", xs.display);
     let auth = xs.auth_file.clone();
     lock(&running).xserver = Some(xs);
@@ -162,6 +168,7 @@ fn run() -> Result<i32, String> {
         .env("GDK_BACKEND", "x11")
         .env("QT_QPA_PLATFORM", "xcb")
         .env_remove("WAYLAND_DISPLAY")
+        .envs(scale::environment(dpi))
         .stdin(Stdio::null())
         .stdout(to_stderr())
         .stderr(to_stderr())

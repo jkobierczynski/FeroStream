@@ -6,6 +6,8 @@ mod agent;
 #[cfg(unix)]
 mod keyboard;
 #[cfg(unix)]
+mod scale;
+#[cfg(unix)]
 mod session;
 #[cfg(unix)]
 mod xserver;

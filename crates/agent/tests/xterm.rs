@@ -32,6 +32,10 @@ struct Agent {
 
 impl Agent {
     fn start(argv: &[&str]) -> Agent {
+        Self::start_at(argv, 96)
+    }
+
+    fn start_at(argv: &[&str], dpi: u16) -> Agent {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferostream-agent"))
             .arg("--stdio")
             .stdin(Stdio::piped())
@@ -64,6 +68,7 @@ impl Agent {
         a.send(Message::Start {
             width: 1024,
             height: 768,
+            dpi,
             argv: argv.iter().map(|s| s.to_string()).collect(),
         });
         a
@@ -185,4 +190,46 @@ fn missing_program_is_reported() {
         Message::Error { message } => assert!(message.contains("could not start"), "{message}"),
         other => panic!("expected an error, got {other:?}"),
     }
+}
+
+/// The first normal window's size, then the session is dropped.
+fn first_window(argv: &[&str], dpi: u16) -> (u16, u16) {
+    let mut a = Agent::start_at(argv, dpi);
+    let size = loop {
+        match a.next() {
+            Message::WindowNew {
+                width,
+                height,
+                kind: WindowKind::Normal,
+                ..
+            } => break (width, height),
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
+    };
+    // Ending input is how a session ends (the SSH connection closing); the
+    // agent then stops the program and Xvfb.
+    drop(a.child.stdin.take());
+    let _ = a.child.wait();
+    size
+}
+
+#[test]
+fn text_grows_with_the_client_dpi() {
+    if !(have("Xvfb") && have("xterm")) {
+        assert!(std::env::var_os("FEROSTREAM_REQUIRE_X").is_none());
+        return;
+    }
+    let xterm = ["xterm", "-geometry", "40x10"];
+    let (w1, h1) = first_window(&xterm, 96);
+    let (w2, h2) = first_window(&xterm, 192);
+    // Same 40x10 characters, twice the DPI: about twice the pixels.
+    assert!(
+        u32::from(w2) * 10 >= u32::from(w1) * 17 && u32::from(h2) * 10 >= u32::from(h1) * 17,
+        "96 dpi: {w1}x{h1}, 192 dpi: {w2}x{h2}"
+    );
+    // GTK gets whole-number scaling at 200 %.
+    let check = "test \"$GDK_SCALE\" = 2 && test \"$GDK_DPI_SCALE\" = 0.5000 && exec xterm";
+    let (w, _) = first_window(&["sh", "-c", check], 192);
+    assert!(w > 1);
 }
