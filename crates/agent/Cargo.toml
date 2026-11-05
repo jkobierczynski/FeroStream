@@ -1,0 +1,18 @@
+[package]
+name = "ferostream-agent"
+description = "FeroStream agent: runs Linux apps on a private X display and streams their windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferostream-proto.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+x11rb = { version = "0.14", default-features = false, features = ["composite", "damage", "xfixes", "xtest"] }
+getrandom = "0.4"
+
+[lints]
+workspace = true

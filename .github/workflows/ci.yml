@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml and installs the pinned toolchain.
+      - run: rustup show active-toolchain
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p ferostream-client
+      - name: Report exe size
+        shell: pwsh
+        run: |
+          $size = (Get-Item target/release/ferostream.exe).Length
+          "ferostream.exe: $([math]::Round($size / 1KB)) KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferostream-exe
+          path: target/release/ferostream.exe
+
+  linux:
+    name: Agent against Xvfb (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: sudo apt-get update && sudo apt-get install -y xvfb xterm
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The xterm test must run here, not skip.
+      - run: cargo test --workspace --locked
+        env:
+          FEROSTREAM_REQUIRE_X: "1"
+      # One static binary that runs on any x86-64 Linux.
+      - run: cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
+      - name: Report agent size
+        run: |
+          size=$(stat -c %s target/x86_64-unknown-linux-musl/release/ferostream-agent)
+          echo "ferostream-agent (static, musl): $((size / 1024)) KB" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferostream-agent-linux-x86_64
+          path: target/x86_64-unknown-linux-musl/release/ferostream-agent
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  fuzz:
+    name: Fuzz smoke run
+    runs-on: ubuntu-latest
+    # Same pinned nightly as FeroSSH.
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-10-31
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Inputs that once crashed a target start its corpus.
+      - run: mkdir -p fuzz/corpus && cp -r fuzz/regressions/. fuzz/corpus/
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu frame_decode -- -max_total_time=60
