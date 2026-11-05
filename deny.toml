@@ -1,0 +1,32 @@
+# cargo-deny: licences, advisories, bans and sources for every dependency.
+[graph]
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # No C crypto: QUIC (step 4) uses rustls on ring, as FeroSSH does.
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    { name = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

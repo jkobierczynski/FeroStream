@@ -1,0 +1,22 @@
+//! `ferostream-agent`: runs a Linux program on a private X display and
+//! streams its windows to a FeroStream client over stdin and stdout.
+
+#[cfg(unix)]
+mod agent;
+#[cfg(unix)]
+mod keyboard;
+#[cfg(unix)]
+mod session;
+#[cfg(unix)]
+mod xserver;
+
+#[cfg(unix)]
+fn main() -> std::process::ExitCode {
+    agent::main()
+}
+
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!("ferostream-agent runs on Linux (it needs Xvfb).");
+    std::process::ExitCode::FAILURE
+}

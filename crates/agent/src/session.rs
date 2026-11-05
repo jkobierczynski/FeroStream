@@ -1,0 +1,735 @@
+//! Watching the private display: which windows exist, which pixels changed,
+//! and injecting the client's input.
+//!
+//! Every top-level window is redirected off-screen (Composite), so each one
+//! keeps all its pixels even where others overlap it. Damage reports what
+//! changed; GetImage reads it back; the tiles go to the client LZ4-packed.
+//! There is no window manager: windows sit where the client puts them.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use ferostream_proto::tile::{MAX_TILE_SIDE, Tile};
+use ferostream_proto::{MAX_WINDOW_SIDE, Message, WindowKind};
+use x11rb::connection::Connection;
+use x11rb::protocol::Event;
+use x11rb::protocol::composite::{self, ConnectionExt as _};
+use x11rb::protocol::damage::{self, ConnectionExt as _};
+use x11rb::protocol::xfixes::ConnectionExt as _;
+use x11rb::protocol::xproto::{self, ConnectionExt as _};
+use x11rb::protocol::xtest::ConnectionExt as _;
+use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
+
+use crate::keyboard::Keyboard;
+
+/// Frames a window may have unacknowledged before the agent waits for the
+/// client (keeps a slow link from queueing stale pictures).
+const MAX_IN_FLIGHT: u32 = 2;
+
+/// More damaged rectangles than this in one window are sent as their
+/// bounding box.
+const MAX_RECTS: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rect {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+}
+
+#[derive(Debug)]
+struct Win {
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+    popup: bool,
+    damage: damage::Damage,
+    dirty: Vec<Rect>,
+    sent: u32,
+    acked: u32,
+}
+
+impl Win {
+    fn full(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: self.w,
+            h: self.h,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct State {
+    windows: BTreeMap<u32, Win>,
+    exited: Option<i32>,
+}
+
+/// Writes frames to the client.
+pub trait Sink: Send {
+    fn send(&mut self, frames: &[Message]) -> std::io::Result<()>;
+}
+
+impl<W: Write + Send> Sink for W {
+    fn send(&mut self, frames: &[Message]) -> std::io::Result<()> {
+        for m in frames {
+            self.write_all(&m.encode())?;
+        }
+        self.flush()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Atoms {
+    net_wm_name: xproto::Atom,
+    utf8_string: xproto::Atom,
+    wm_protocols: xproto::Atom,
+    wm_delete_window: xproto::Atom,
+    wake: xproto::Atom,
+}
+
+/// The display, shared by the X event thread and the input thread.
+pub struct Session {
+    conn: RustConnection,
+    root: xproto::Window,
+    wake_window: xproto::Window,
+    atoms: Atoms,
+    state: Mutex<State>,
+    keyboard: Mutex<Keyboard>,
+    out: Mutex<Box<dyn Sink>>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session").field("root", &self.root).finish()
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn err(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+impl Session {
+    /// Sets up redirection and event selection on a fresh display.
+    pub fn new(
+        conn: RustConnection,
+        screen: usize,
+        out: Box<dyn Sink>,
+    ) -> Result<Arc<Session>, String> {
+        let root = conn
+            .setup()
+            .roots
+            .get(screen)
+            .ok_or("the X server has no screen 0")?
+            .root;
+        for (name, ok) in [
+            (
+                "Composite",
+                conn.composite_query_version(0, 4)
+                    .map_err(err)?
+                    .reply()
+                    .is_ok(),
+            ),
+            (
+                "XFIXES",
+                conn.xfixes_query_version(5, 0)
+                    .map_err(err)?
+                    .reply()
+                    .is_ok(),
+            ),
+            (
+                "DAMAGE",
+                conn.damage_query_version(1, 1)
+                    .map_err(err)?
+                    .reply()
+                    .is_ok(),
+            ),
+            (
+                "XTEST",
+                conn.xtest_get_version(2, 2).map_err(err)?.reply().is_ok(),
+            ),
+        ] {
+            if !ok {
+                return Err(format!("the X server lacks the {name} extension"));
+            }
+        }
+        let intern = |name: &[u8]| -> Result<xproto::Atom, String> {
+            Ok(conn
+                .intern_atom(false, name)
+                .map_err(err)?
+                .reply()
+                .map_err(err)?
+                .atom)
+        };
+        let atoms = Atoms {
+            net_wm_name: intern(b"_NET_WM_NAME")?,
+            utf8_string: intern(b"UTF8_STRING")?,
+            wm_protocols: intern(b"WM_PROTOCOLS")?,
+            wm_delete_window: intern(b"WM_DELETE_WINDOW")?,
+            wake: intern(b"_FEROSTREAM_WAKE")?,
+        };
+        conn.change_window_attributes(
+            root,
+            &xproto::ChangeWindowAttributesAux::new()
+                .event_mask(xproto::EventMask::SUBSTRUCTURE_NOTIFY),
+        )
+        .map_err(err)?;
+        conn.composite_redirect_subwindows(root, composite::Redirect::MANUAL)
+            .map_err(err)?;
+        // An unmapped InputOnly window the input thread sends ClientMessages
+        // to, to wake the event thread (an acknowledged frame, a stop).
+        let wake_window = conn.generate_id().map_err(err)?;
+        conn.create_window(
+            0,
+            wake_window,
+            root,
+            -10,
+            -10,
+            1,
+            1,
+            0,
+            xproto::WindowClass::INPUT_ONLY,
+            0,
+            &xproto::CreateWindowAux::new().override_redirect(1),
+        )
+        .map_err(err)?;
+        let keyboard = Keyboard::load(&conn)?;
+        conn.sync().map_err(err)?;
+        Ok(Arc::new(Session {
+            conn,
+            root,
+            wake_window,
+            atoms,
+            state: Mutex::new(State::default()),
+            keyboard: Mutex::new(keyboard),
+            out: Mutex::new(out),
+        }))
+    }
+
+    fn send(&self, frames: &[Message]) -> Result<(), String> {
+        lock(&self.out)
+            .send(frames)
+            .map_err(|e| format!("the client went away: {e}"))
+    }
+
+    /// Sends the last message of the session.
+    pub fn finish(&self, last: &Message) {
+        let _ = lock(&self.out).send(std::slice::from_ref(last));
+    }
+
+    /// Wakes the event thread.
+    pub fn wake(&self) {
+        let ev = xproto::ClientMessageEvent::new(32, self.wake_window, self.atoms.wake, [0u32; 5]);
+        let _ = self
+            .conn
+            .send_event(false, self.wake_window, xproto::EventMask::NO_EVENT, ev);
+        let _ = self.conn.flush();
+    }
+
+    /// The program ended with `code`; the session ends when its windows
+    /// are gone too.
+    pub fn program_exited(&self, code: i32) {
+        lock(&self.state).exited = Some(code);
+        self.wake();
+    }
+
+    /// Runs the event loop until the program and all its windows are gone.
+    /// Returns the program's exit code.
+    pub fn run(&self) -> Result<i32, String> {
+        loop {
+            let ev = self.conn.wait_for_event().map_err(err)?;
+            self.handle(ev)?;
+            while let Some(ev) = self.conn.poll_for_event().map_err(err)? {
+                self.handle(ev)?;
+            }
+            self.flush_damage()?;
+            let st = lock(&self.state);
+            if let Some(code) = st.exited
+                && st.windows.is_empty()
+            {
+                return Ok(code);
+            }
+        }
+    }
+
+    fn handle(&self, ev: Event) -> Result<(), String> {
+        match ev {
+            Event::MapNotify(e) if e.event == self.root && e.window != self.wake_window => {
+                self.add_window(e.window, e.override_redirect)?;
+            }
+            Event::UnmapNotify(e) if e.event == self.root => self.remove_window(e.window, true)?,
+            Event::DestroyNotify(e) if e.event == self.root => {
+                self.remove_window(e.window, false)?
+            }
+            Event::ConfigureNotify(e) if e.event == self.root => {
+                let mut st = lock(&self.state);
+                if let Some(w) = st.windows.get_mut(&e.window) {
+                    let (nw, nh) = (clamp_side(e.width), clamp_side(e.height));
+                    let resized = (nw, nh) != (w.w, w.h);
+                    let moved = (e.x, e.y) != (w.x, w.y);
+                    w.x = e.x;
+                    w.y = e.y;
+                    w.w = nw;
+                    w.h = nh;
+                    if resized {
+                        w.dirty.clear();
+                        let full = w.full();
+                        w.dirty.push(full);
+                    }
+                    if resized || moved {
+                        let m = Message::WindowConfigure {
+                            window: e.window,
+                            x: i32::from(e.x),
+                            y: i32::from(e.y),
+                            width: nw,
+                            height: nh,
+                        };
+                        drop(st);
+                        self.send(&[m])?;
+                    }
+                }
+            }
+            Event::DamageNotify(e) => {
+                let mut st = lock(&self.state);
+                if let Some(w) = st.windows.get_mut(&e.drawable) {
+                    w.dirty.push(Rect {
+                        x: e.area.x.max(0) as u16,
+                        y: e.area.y.max(0) as u16,
+                        w: e.area.width,
+                        h: e.area.height,
+                    });
+                }
+            }
+            Event::PropertyNotify(e)
+                if (e.atom == self.atoms.net_wm_name
+                    || e.atom == u32::from(xproto::AtomEnum::WM_NAME))
+                    && lock(&self.state).windows.contains_key(&e.window) =>
+            {
+                let title = self.title(e.window);
+                self.send(&[Message::WindowTitle {
+                    window: e.window,
+                    title,
+                }])?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn add_window(&self, window: xproto::Window, override_redirect: bool) -> Result<(), String> {
+        if lock(&self.state).windows.contains_key(&window) {
+            return Ok(());
+        }
+        let Ok(Ok(attrs)) = self.conn.get_window_attributes(window).map(|c| c.reply()) else {
+            return Ok(());
+        };
+        if attrs.class == xproto::WindowClass::INPUT_ONLY {
+            return Ok(());
+        }
+        let Ok(Ok(geo)) = self.conn.get_geometry(window).map(|c| c.reply()) else {
+            return Ok(());
+        };
+        let _ = self.conn.change_window_attributes(
+            window,
+            &xproto::ChangeWindowAttributesAux::new()
+                .event_mask(xproto::EventMask::PROPERTY_CHANGE),
+        );
+        let damage = self.conn.generate_id().map_err(err)?;
+        self.conn
+            .damage_create(damage, window, damage::ReportLevel::DELTA_RECTANGLES)
+            .map_err(err)?;
+        let title = self.title(window);
+        let transient_for = self.transient_for(window);
+        let (w, h) = (clamp_side(geo.width), clamp_side(geo.height));
+        let win = Win {
+            x: geo.x,
+            y: geo.y,
+            w,
+            h,
+            popup: override_redirect,
+            damage,
+            dirty: vec![Rect { x: 0, y: 0, w, h }],
+            sent: 0,
+            acked: 0,
+        };
+        let kind = if win.popup {
+            WindowKind::Popup
+        } else {
+            WindowKind::Normal
+        };
+        lock(&self.state).windows.insert(window, win);
+        self.send(&[Message::WindowNew {
+            window,
+            x: i32::from(geo.x),
+            y: i32::from(geo.y),
+            width: w,
+            height: h,
+            kind,
+            transient_for,
+            title,
+        }])
+    }
+
+    fn remove_window(&self, window: xproto::Window, alive: bool) -> Result<(), String> {
+        let Some(w) = lock(&self.state).windows.remove(&window) else {
+            return Ok(());
+        };
+        if alive {
+            let _ = self.conn.damage_destroy(w.damage);
+        }
+        self.send(&[Message::WindowGone { window }])
+    }
+
+    fn title(&self, window: xproto::Window) -> String {
+        let get = |prop: xproto::Atom, ty: xproto::Atom| {
+            self.conn
+                .get_property(false, window, prop, ty, 0, 1024)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .filter(|r| r.format == 8 && !r.value.is_empty())
+                .map(|r| r.value)
+        };
+        if let Some(v) = get(self.atoms.net_wm_name, self.atoms.utf8_string) {
+            return String::from_utf8_lossy(&v).into_owned();
+        }
+        if let Some(v) = get(
+            xproto::AtomEnum::WM_NAME.into(),
+            xproto::AtomEnum::ANY.into(),
+        ) {
+            // STRING is Latin-1; COMPOUND_TEXT mostly is too for titles.
+            return v.iter().map(|&b| char::from(b)).collect();
+        }
+        String::new()
+    }
+
+    fn transient_for(&self, window: xproto::Window) -> u32 {
+        self.conn
+            .get_property(
+                false,
+                window,
+                xproto::AtomEnum::WM_TRANSIENT_FOR,
+                xproto::AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut v| v.next()))
+            .unwrap_or(0)
+    }
+
+    /// Sends what changed in every window that is not waiting on the client.
+    fn flush_damage(&self) -> Result<(), String> {
+        let mut work = Vec::new();
+        {
+            let mut st = lock(&self.state);
+            for (&id, w) in st.windows.iter_mut() {
+                if w.dirty.is_empty() || w.sent.wrapping_sub(w.acked) >= MAX_IN_FLIGHT {
+                    continue;
+                }
+                let rects = merge(std::mem::take(&mut w.dirty), w.w, w.h);
+                w.sent = w.sent.wrapping_add(1);
+                work.push((id, w.damage, rects, w.sent));
+            }
+        }
+        for (id, damage, rects, seq) in work {
+            // Re-arm damage reporting before reading, so a change made while
+            // we read is reported again rather than lost.
+            let _ = self.conn.damage_subtract(damage, x11rb::NONE, x11rb::NONE);
+            let mut cookies = Vec::new();
+            for r in rects.iter().flat_map(|r| split(*r)) {
+                let c = self
+                    .conn
+                    .get_image(
+                        xproto::ImageFormat::Z_PIXMAP,
+                        id,
+                        r.x as i16,
+                        r.y as i16,
+                        r.w,
+                        r.h,
+                        !0,
+                    )
+                    .map_err(err)?;
+                cookies.push((r, c));
+            }
+            let mut frames = Vec::with_capacity(cookies.len() + 1);
+            for (r, c) in cookies {
+                // A window that went away meanwhile answers with an error.
+                let Ok(img) = c.reply() else { continue };
+                let want = usize::from(r.w) * usize::from(r.h) * 4;
+                if img.data.len() != want {
+                    continue;
+                }
+                frames.push(Message::Tile(Tile::lz4(id, r.x, r.y, r.w, r.h, &img.data)));
+            }
+            frames.push(Message::FrameEnd { window: id, seq });
+            self.send(&frames)?;
+        }
+        Ok(())
+    }
+
+    // ----- Input from the client (called on the input thread) -----
+
+    /// Handles one message from the client.
+    pub fn input(&self, m: Message) -> Result<(), String> {
+        match m {
+            Message::PointerMove { window, x, y } => self.pointer(window, x, y),
+            Message::PointerButton {
+                window,
+                x,
+                y,
+                button,
+                down,
+            } => {
+                self.pointer(window, x, y);
+                let kind = if down {
+                    xproto::BUTTON_PRESS_EVENT
+                } else {
+                    xproto::BUTTON_RELEASE_EVENT
+                };
+                if (1..=9).contains(&button) {
+                    let _ = self.conn.xtest_fake_input(
+                        kind,
+                        button,
+                        x11rb::CURRENT_TIME,
+                        self.root,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+            Message::Key { keysym, down } => {
+                lock(&self.keyboard).key(&self.conn, self.root, keysym, down);
+            }
+            Message::Text { ch } => lock(&self.keyboard).text(&self.conn, self.root, ch),
+            Message::FrameAck { window, seq } => {
+                let mut st = lock(&self.state);
+                if let Some(w) = st.windows.get_mut(&window) {
+                    // Only a sequence number we sent counts.
+                    if w.sent.wrapping_sub(seq) < MAX_IN_FLIGHT + 1 {
+                        w.acked = seq;
+                    }
+                    if !w.dirty.is_empty() {
+                        drop(st);
+                        self.wake();
+                    }
+                }
+            }
+            Message::Focus { window } => {
+                let normal = lock(&self.state)
+                    .windows
+                    .get(&window)
+                    .is_some_and(|w| !w.popup);
+                if normal {
+                    let _ = self.conn.set_input_focus(
+                        xproto::InputFocus::PARENT,
+                        window,
+                        x11rb::CURRENT_TIME,
+                    );
+                    let _ = self.conn.configure_window(
+                        window,
+                        &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+                    );
+                } else if window == 0 {
+                    lock(&self.keyboard).release_all(&self.conn, self.root);
+                }
+            }
+            Message::WindowMove {
+                window,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if lock(&self.state).windows.contains_key(&window) {
+                    let _ = self.conn.configure_window(
+                        window,
+                        &xproto::ConfigureWindowAux::new()
+                            .x(x)
+                            .y(y)
+                            .width(u32::from(width))
+                            .height(u32::from(height)),
+                    );
+                }
+            }
+            Message::WindowClose { window } => self.close(window),
+            Message::Ping { token } => self.send(&[Message::Pong { token }])?,
+            _ => {}
+        }
+        let _ = self.conn.flush();
+        Ok(())
+    }
+
+    fn pointer(&self, window: u32, x: i32, y: i32) {
+        let origin = lock(&self.state)
+            .windows
+            .get(&window)
+            .map(|w| (i32::from(w.x), i32::from(w.y)));
+        if let Some((wx, wy)) = origin {
+            let rx = (wx + x).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let ry = (wy + y).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let _ = self.conn.xtest_fake_input(
+                xproto::MOTION_NOTIFY_EVENT,
+                0,
+                x11rb::CURRENT_TIME,
+                self.root,
+                rx,
+                ry,
+                0,
+            );
+        }
+    }
+
+    /// Asks a window to close (WM_DELETE_WINDOW), or disconnects its
+    /// program when it does not take part in that protocol.
+    fn close(&self, window: u32) {
+        if !lock(&self.state).windows.contains_key(&window) {
+            return;
+        }
+        let polite = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.wm_protocols,
+                xproto::AtomEnum::ATOM,
+                0,
+                64,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| {
+                r.value32()
+                    .map(|mut v| v.any(|a| a == self.atoms.wm_delete_window))
+            })
+            .unwrap_or(false);
+        if polite {
+            let ev = xproto::ClientMessageEvent::new(
+                32,
+                window,
+                self.atoms.wm_protocols,
+                [self.atoms.wm_delete_window, 0, 0, 0, 0],
+            );
+            let _ = self
+                .conn
+                .send_event(false, window, xproto::EventMask::NO_EVENT, ev);
+        } else {
+            let _ = self.conn.kill_client(window);
+        }
+    }
+}
+
+fn clamp_side(v: u16) -> u16 {
+    v.clamp(1, MAX_WINDOW_SIDE)
+}
+
+/// Clips rectangles to the window and merges them when there are many.
+fn merge(rects: Vec<Rect>, w: u16, h: u16) -> Vec<Rect> {
+    let mut out: Vec<Rect> = Vec::new();
+    for r in rects {
+        if r.x >= w || r.y >= h {
+            continue;
+        }
+        let r = Rect {
+            x: r.x,
+            y: r.y,
+            w: r.w.min(w - r.x),
+            h: r.h.min(h - r.y),
+        };
+        if r.w == 0 || r.h == 0 {
+            continue;
+        }
+        // Skip rectangles inside one already taken.
+        if out
+            .iter()
+            .any(|o| o.x <= r.x && o.y <= r.y && o.x + o.w >= r.x + r.w && o.y + o.h >= r.y + r.h)
+        {
+            continue;
+        }
+        out.retain(|o| {
+            !(r.x <= o.x && r.y <= o.y && r.x + r.w >= o.x + o.w && r.y + r.h >= o.y + o.h)
+        });
+        out.push(r);
+    }
+    if out.len() > MAX_RECTS {
+        let x0 = out.iter().map(|r| r.x).min().unwrap_or(0);
+        let y0 = out.iter().map(|r| r.y).min().unwrap_or(0);
+        let x1 = out.iter().map(|r| r.x + r.w).max().unwrap_or(0);
+        let y1 = out.iter().map(|r| r.y + r.h).max().unwrap_or(0);
+        out = vec![Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        }];
+    }
+    out
+}
+
+/// Cuts a rectangle into tiles of at most [`MAX_TILE_SIDE`] a side.
+fn split(r: Rect) -> impl Iterator<Item = Rect> {
+    let step = MAX_TILE_SIDE;
+    (0..r.h.div_ceil(step)).flat_map(move |ty| {
+        (0..r.w.div_ceil(step)).map(move |tx| {
+            let x = tx * step;
+            let y = ty * step;
+            Rect {
+                x: r.x + x,
+                y: r.y + y,
+                w: (r.w - x).min(step),
+                h: (r.h - y).min(step),
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use super::*;
+
+    fn r(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn merge_clips_and_drops_contained() {
+        let m = merge(
+            vec![r(0, 0, 10, 10), r(2, 2, 3, 3), r(5, 5, 100, 100)],
+            50,
+            40,
+        );
+        assert_eq!(m, vec![r(0, 0, 10, 10), r(5, 5, 45, 35)]);
+        let many: Vec<Rect> = (0..40).map(|i| r(i, i, 1, 1)).collect();
+        assert_eq!(merge(many, 100, 100), vec![r(0, 0, 40, 40)]);
+    }
+
+    #[test]
+    fn split_covers_exactly() {
+        let tiles: Vec<Rect> = split(r(3, 4, 1100, 600)).collect();
+        assert_eq!(tiles.len(), 6);
+        let area: u32 = tiles.iter().map(|t| u32::from(t.w) * u32::from(t.h)).sum();
+        assert_eq!(area, 1100 * 600);
+        assert!(
+            tiles
+                .iter()
+                .all(|t| t.w <= MAX_TILE_SIDE && t.h <= MAX_TILE_SIDE)
+        );
+    }
+}
