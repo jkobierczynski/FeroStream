@@ -66,6 +66,28 @@ struct Remote {
     kind: WindowKind,
     /// Last pointer position in this window, for wheel clicks.
     pointer: (i32, i32),
+    /// Tiles of the frame still arriving: drawn together at FrameEnd, so a
+    /// half-received frame is never on screen.
+    pending: Vec<ferostream_proto::tile::Tile>,
+}
+
+impl Remote {
+    /// Draws the tiles received so far.
+    fn apply_pending(&mut self) {
+        for t in std::mem::take(&mut self.pending) {
+            if let Some(c) = self.fb.apply(&t) {
+                let rect = RECT {
+                    left: i32::from(c.x),
+                    top: i32::from(c.y),
+                    right: i32::from(c.x) + i32::from(c.width),
+                    bottom: i32::from(c.y) + i32::from(c.height),
+                };
+                unsafe {
+                    let _ = InvalidateRect(Some(self.hwnd), Some(&rect), false);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -335,6 +357,8 @@ impl App {
             } => {
                 let origin = self.origin;
                 if let Some(r) = self.windows.get_mut(&window) {
+                    // Tiles before a resize belong to the old size.
+                    r.apply_pending();
                     r.fb.resize(width, height);
                     place(r.hwnd, origin.0 + x, origin.1 + y, width, height, true);
                     unsafe {
@@ -358,21 +382,16 @@ impl App {
                 }
             }
             Message::Tile(t) => {
-                if let Some(r) = self.windows.get_mut(&t.window)
-                    && let Some(c) = r.fb.apply(&t)
-                {
-                    let rect = RECT {
-                        left: i32::from(c.x),
-                        top: i32::from(c.y),
-                        right: i32::from(c.x) + i32::from(c.width),
-                        bottom: i32::from(c.y) + i32::from(c.height),
-                    };
-                    unsafe {
-                        let _ = InvalidateRect(Some(r.hwnd), Some(&rect), false);
-                    }
+                if let Some(r) = self.windows.get_mut(&t.window) {
+                    r.pending.push(t);
                 }
             }
-            Message::FrameEnd { window, seq } => self.link.send(Message::FrameAck { window, seq }),
+            Message::FrameEnd { window, seq } => {
+                if let Some(r) = self.windows.get_mut(&window) {
+                    r.apply_pending();
+                }
+                self.link.send(Message::FrameAck { window, seq });
+            }
             Message::Ping { token } => self.link.send(Message::Pong { token }),
             Message::Exited { code } => {
                 self.ended = true;
@@ -452,6 +471,7 @@ impl App {
                 fb: Framebuffer::new(width, height),
                 kind,
                 pointer: (0, 0),
+                pending: Vec::new(),
             },
         );
         self.by_hwnd.insert(hwnd.0 as isize, window);
