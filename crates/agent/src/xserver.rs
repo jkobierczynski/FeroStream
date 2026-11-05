@@ -25,8 +25,8 @@ const FIRST_DISPLAY: u32 = 100;
 const LAST_DISPLAY: u32 = 399;
 
 impl XServer {
-    /// Starts Xvfb with a `width` x `height` screen.
-    pub fn start(width: u16, height: u16) -> Result<XServer, String> {
+    /// Starts Xvfb with a `width` x `height` screen at `dpi`.
+    pub fn start(width: u16, height: u16, dpi: u16) -> Result<XServer, String> {
         let mut cookie = [0u8; 16];
         getrandom::fill(&mut cookie).map_err(|e| format!("no random numbers: {e}"))?;
         let dir = private_dir()?;
@@ -44,6 +44,8 @@ impl XServer {
                 .arg(format!(":{display}"))
                 .args(["-screen", "0"])
                 .arg(format!("{width}x{height}x24"))
+                .arg("-dpi")
+                .arg(dpi.to_string())
                 .args(["-nolisten", "tcp", "-noreset", "-auth"])
                 .arg(&auth_file)
                 .stdin(Stdio::null())
