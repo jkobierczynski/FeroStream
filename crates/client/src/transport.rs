@@ -22,6 +22,9 @@ options:
   -o OPTION      any ssh option (repeatable), as ssh -o
   --ssh PATH     the ssh program (default: Windows OpenSSH)
   --agent PATH   the agent's path on the host
+  --clipboard WAY  share copied text: both (default), to-host, from-host
+                 or off. Text copied on Windows goes to the host when you
+                 switch to one of its windows.
   -h, --help     this text";
 
 /// What the command line asked for.
@@ -36,6 +39,33 @@ pub struct Options {
     /// The program and its arguments (sent to the agent, never through a
     /// shell).
     pub program: Vec<String>,
+    pub clipboard: Clipboard,
+}
+
+/// Which ways copied text may travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Clipboard {
+    /// Windows to the host.
+    pub to_host: bool,
+    /// The host to Windows.
+    pub from_host: bool,
+}
+
+impl Clipboard {
+    fn parse(s: &str) -> Result<Clipboard, String> {
+        let (to_host, from_host) = match s {
+            "both" => (true, true),
+            "to-host" => (true, false),
+            "from-host" => (false, true),
+            "off" | "none" => (false, false),
+            _ => {
+                return Err(format!(
+                    "--clipboard takes both, to-host, from-host or off, not {s}"
+                ));
+            }
+        };
+        Ok(Clipboard { to_host, from_host })
+    }
 }
 
 /// The remote command when no agent path is given: `~/.local/bin` first,
@@ -48,6 +78,10 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut ssh = None;
     let mut ssh_args = Vec::new();
     let mut agent = None;
+    let mut clipboard = Clipboard {
+        to_host: true,
+        from_host: true,
+    };
     let mut it = args.iter();
     let destination = loop {
         let Some(a) = it.next() else {
@@ -67,6 +101,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--ssh" => ssh = Some(PathBuf::from(value(a)?)),
             "--agent" => agent = Some(value(a)?),
+            "--clipboard" => clipboard = Clipboard::parse(&value(a)?)?,
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             _ => break a.clone(),
         }
@@ -84,6 +119,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         destination,
         agent,
         program,
+        clipboard,
     }))
 }
 
@@ -156,6 +192,19 @@ mod tests {
         assert!(parse_args(&args("-p")).is_err());
         assert!(parse_args(&args("-x box")).is_err());
         assert_eq!(parse_args(&args("--help")), Ok(None));
+        assert!(parse_args(&args("--clipboard sideways box")).is_err());
+    }
+
+    #[test]
+    fn clipboard_ways() {
+        let both = parse_args(&args("box")).unwrap().unwrap().clipboard;
+        assert!(both.to_host && both.from_host);
+        let o = parse_args(&args("--clipboard from-host box"))
+            .unwrap()
+            .unwrap();
+        assert!(!o.clipboard.to_host && o.clipboard.from_host);
+        let o = parse_args(&args("--clipboard off box")).unwrap().unwrap();
+        assert!(!o.clipboard.to_host && !o.clipboard.from_host);
     }
 
     #[test]

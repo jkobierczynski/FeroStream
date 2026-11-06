@@ -11,7 +11,7 @@ repository.workspace = true
 ferostream-proto.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-x11rb = { version = "0.14", default-features = false, features = ["composite", "damage", "xfixes", "xtest"] }
+x11rb = { version = "0.14", default-features = false, features = ["composite", "damage", "randr", "xfixes", "xtest"] }
 getrandom = "0.4"
 
 [lints]

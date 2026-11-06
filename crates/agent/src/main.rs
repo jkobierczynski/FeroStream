@@ -4,6 +4,8 @@
 #[cfg(unix)]
 mod agent;
 #[cfg(unix)]
+mod clipboard;
+#[cfg(unix)]
 mod keyboard;
 #[cfg(unix)]
 mod scale;

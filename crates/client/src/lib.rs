@@ -5,6 +5,9 @@
 //! and test anywhere; the windows themselves are Win32 and build on Windows
 //! only.
 
+#[cfg(windows)]
+pub mod clip;
+pub mod cliptext;
 pub mod fb;
 pub mod keys;
 pub mod link;
