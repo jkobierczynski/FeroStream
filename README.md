@@ -26,14 +26,22 @@ will.
 
 ## Status
 
-Steps 1 and 2 of the [plan](https://claude.ai/artifact/256vVGrd767CWXCAcpPEd1):
+Steps 1 to 3 of the [plan](https://claude.ai/artifact/256vVGrd767CWXCAcpPEd1):
 windows appear, pixels stream (LZ4 tiles), mouse and keyboard work, titles
 and icons show on the taskbar, text is sized for your screen's scaling, the
 pointer takes the program's shapes, dialogs stay above their window, menus
 and tooltips have no frame, size limits hold, and minimise, maximise and
-full screen work from either side. Closing the window or exiting the program
-ends the session. Not yet: clipboard, multiple monitors, smarter
-compression, QUIC, reattaching to a running session.
+full screen work from either side. Copied text travels both ways, programs
+know your screen layout, and open menus close when you click into another
+Windows program. Closing the window or exiting the program ends the
+session. Not yet: screens with different scaling, smarter compression,
+QUIC, reattaching to a running session.
+
+Copied text: what a program copies lands on the Windows clipboard; what you
+copy on Windows reaches the host when you switch to one of its windows
+(Ctrl+V in programs, and middle click or Shift+Insert in xterm).
+`--clipboard to-host`, `from-host` or `off` limits that, for example for a
+host you trust less.
 
 Typing goes through your Windows keyboard layout: the client sends the
 characters Windows produces (dead keys and AltGr included), so the host

@@ -25,9 +25,9 @@ use ferostream_proto::{Message, VERSION, WindowKind, WindowState};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, ClientToScreen, CreateSolidBrush,
-    DIB_RGB_COLORS, EndPaint, FillRect, GetMonitorInfoW, HBRUSH, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SRCCOPY, ScreenToClient,
-    StretchDIBits,
+    DIB_RGB_COLORS, EndPaint, EnumDisplayMonitors, FillRect, GetMonitorInfoW, HBRUSH, HDC,
+    HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    PAINTSTRUCT, SRCCOPY, ScreenToClient, StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -40,10 +40,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
 
+use crate::clip;
 use crate::fb::Framebuffer;
 use crate::keys;
 use crate::link::{Event, Link};
-use crate::transport::{Options, ssh_command};
+use crate::transport::{Clipboard, Options, ssh_command};
 
 const WM_LINK: u32 = WM_APP + 1;
 const CLASS: PCWSTR = w!("FeroStreamWindow");
@@ -120,6 +121,18 @@ struct App {
     /// The remote pointer shape, shown over every remote window; `None`
     /// until the agent sends one (the arrow until then).
     cursor: Option<HCURSOR>,
+    /// Which ways copied text may travel.
+    clipboard: Clipboard,
+    /// Windows clipboard sequence number when we last looked at it or
+    /// wrote it ourselves.
+    clip_seq: u32,
+    /// Clipboard text last sent or received, never sent back.
+    last_clip: Option<String>,
+    /// The screens, as last sent to the agent.
+    monitors: Vec<ferostream_proto::Monitor>,
+    /// One of our windows is the active window. Every top-level window
+    /// gets WM_ACTIVATEAPP; this makes the agent hear it once.
+    app_active: bool,
     ended: bool,
     exit_code: i32,
     problem: Option<String>,
@@ -253,6 +266,13 @@ pub fn run(options: Options) -> ExitCode {
         argv: options.program.clone(),
     });
 
+    let screens = monitors((ox, oy));
+    if !screens.is_empty() {
+        link.send(Message::Monitors {
+            monitors: screens.clone(),
+        });
+    }
+
     let grey = unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0080_8080)) };
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
@@ -268,6 +288,11 @@ pub fn run(options: Options) -> ExitCode {
             altgr: false,
             high_surrogate: None,
             cursor: None,
+            clipboard: options.clipboard,
+            clip_seq: 0,
+            last_clip: None,
+            monitors: screens,
+            app_active: false,
             ended: false,
             exit_code: 0,
             problem: None,
@@ -448,6 +473,30 @@ impl App {
                 }
             }
             Message::WindowState { window, state } => self.set_state(window, state),
+            Message::Clipboard { text } => {
+                if self.clipboard.from_host {
+                    let owner = HWND(LINK_HWND.load(Ordering::SeqCst) as *mut _);
+                    if clip::write(owner, &text) {
+                        // Our own write is not news for the host.
+                        self.clip_seq = clip::sequence();
+                        self.last_clip = Some(text);
+                    }
+                }
+            }
+            Message::WindowActivate { window } => {
+                if let Some(r) = self.windows.get(&window) {
+                    unsafe {
+                        if IsIconic(r.hwnd).as_bool() {
+                            let _ = ShowWindow(r.hwnd, SW_RESTORE);
+                        }
+                        // Windows may refuse to hand over the foreground;
+                        // the taskbar button flashes instead.
+                        if !SetForegroundWindow(r.hwnd).as_bool() {
+                            let _ = FlashWindow(r.hwnd, true);
+                        }
+                    }
+                }
+            }
             Message::Ping { token } => self.link.send(Message::Pong { token }),
             Message::Exited { code } => {
                 self.ended = true;
@@ -683,6 +732,25 @@ impl App {
         });
     }
 
+    /// Sends what was copied on Windows since we last looked, as the user
+    /// turns to a remote window.
+    fn push_clipboard(&mut self) {
+        if !self.clipboard.to_host {
+            return;
+        }
+        let seq = clip::sequence();
+        if seq == self.clip_seq {
+            return;
+        }
+        self.clip_seq = seq;
+        let Some(text) = clip::read() else { return };
+        if text.is_empty() || self.last_clip.as_deref() == Some(&text) {
+            return;
+        }
+        self.last_clip = Some(text.clone());
+        self.link.send(Message::Clipboard { text });
+    }
+
     fn release_held(&mut self) {
         for keysym in self.held.drain(..) {
             self.link.send(Message::Key {
@@ -697,7 +765,6 @@ impl App {
             });
         }
         self.altgr = false;
-        self.link.send(Message::Focus { window: 0 });
     }
 
     fn key(&mut self, keysym: u32, down: bool) {
@@ -726,6 +793,51 @@ fn styles(kind: WindowKind) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
 }
 
 /// Screen position of a window's client area.
+/// The screens of the desktop, relative to the virtual screen's top left
+/// (`origin`), the primary one first.
+fn monitors(origin: (i32, i32)) -> Vec<ferostream_proto::Monitor> {
+    extern "system" fn each(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> windows::core::BOOL {
+        // SAFETY: `data` is the Vec below, alive for the whole enumeration.
+        let found = unsafe { &mut *(data.0 as *mut Vec<(bool, RECT)>) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            found.push((info.dwFlags & MONITORINFOF_PRIMARY != 0, info.rcMonitor));
+        }
+        windows::core::BOOL(1)
+    }
+    let mut found: Vec<(bool, RECT)> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM((&raw mut found) as isize));
+    }
+    // The primary screen first (Vec::sort_by_key is stable).
+    found.sort_by_key(|(primary, _)| !primary);
+    let limit = i32::from(ferostream_proto::MAX_WINDOW_SIDE);
+    found
+        .into_iter()
+        .take(ferostream_proto::MAX_MONITORS)
+        .filter_map(|(_, r)| {
+            let x = (r.left - origin.0).clamp(0, limit - 1);
+            let y = (r.top - origin.1).clamp(0, limit - 1);
+            let w = (r.right - r.left).clamp(1, limit - x);
+            let h = (r.bottom - r.top).clamp(1, limit - y);
+            Some(ferostream_proto::Monitor {
+                x: u16::try_from(x).ok()?,
+                y: u16::try_from(y).ok()?,
+                width: u16::try_from(w).ok()?,
+                height: u16::try_from(h).ok()?,
+            })
+        })
+        .collect()
+}
+
 fn client_origin(hwnd: HWND) -> (i32, i32) {
     let mut p = POINT { x: 0, y: 0 };
     unsafe {
@@ -1031,9 +1143,30 @@ fn on_window(
         WM_ACTIVATE => {
             let active = (wparam.0 & 0xffff) as u32 != WA_INACTIVE;
             if active {
+                app.app_active = true;
+                app.push_clipboard();
                 app.link.send(Message::Focus { window: id });
             } else {
                 app.release_held();
+            }
+            None
+        }
+        WM_ACTIVATEAPP => {
+            // Another program got the focus (not just another of our
+            // windows): the agent closes open menus, as a click elsewhere
+            // on a Linux desktop would.
+            if wparam.0 == 0 && app.app_active {
+                app.app_active = false;
+                app.release_held();
+                app.link.send(Message::Focus { window: 0 });
+            }
+            None
+        }
+        WM_DISPLAYCHANGE => {
+            let screens = monitors(app.origin);
+            if !screens.is_empty() && screens != app.monitors {
+                app.monitors = screens.clone();
+                app.link.send(Message::Monitors { monitors: screens });
             }
             None
         }

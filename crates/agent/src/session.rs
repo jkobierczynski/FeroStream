@@ -7,7 +7,9 @@
 //! There is no real window manager: windows sit where the client puts them.
 //! The agent does answer the questions programs ask one (EWMH): window
 //! types, maximise and full-screen requests, icons, size limits.
-//! XFixes reports pointer-shape changes, which go to the client as images.
+//! XFixes reports pointer-shape changes, which go to the client as images,
+//! and clipboard changes, whose text goes too. Text copied on Windows is
+//! offered to programs with the agent as the selection owner.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -22,12 +24,14 @@ use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::{self, ConnectionExt as _};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
+use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+use crate::clipboard;
 use crate::keyboard::Keyboard;
 use crate::wm;
 
@@ -84,6 +88,12 @@ struct State {
     exited: Option<i32>,
     /// XFixes serial of the pointer shape last sent.
     cursor: Option<u32>,
+    /// Text copied on Windows that the agent offers as the clipboard.
+    offered: Option<String>,
+    /// Clipboard text last sent to the client (not sent again).
+    sent_clipboard: Option<String>,
+    /// Monitors the agent set up on the display (RandR names).
+    monitors: Vec<xproto::Atom>,
 }
 
 /// Writes frames to the client.
@@ -117,6 +127,9 @@ pub struct Session {
     wake_window: xproto::Window,
     atoms: Atoms,
     wm: wm::Atoms,
+    clip: clipboard::Atoms,
+    /// Screen size, for clicks that must miss every window.
+    screen: (u16, u16),
     /// The client screen's DPI: icons are picked for its size.
     dpi: u16,
     state: Mutex<State>,
@@ -206,6 +219,36 @@ impl Session {
             *slot = intern(name)?;
         }
         let wm = wm::Atoms::from_list(&list);
+        let mut c = [0u32; clipboard::ATOM_NAMES.len()];
+        for (slot, name) in c.iter_mut().zip(clipboard::ATOM_NAMES) {
+            *slot = intern(name)?;
+        }
+        let [
+            clipboard,
+            targets,
+            utf8_string,
+            text,
+            text_plain_utf8,
+            incr,
+            property,
+        ] = c;
+        let clip = clipboard::Atoms {
+            clipboard,
+            primary: xproto::AtomEnum::PRIMARY.into(),
+            targets,
+            utf8_string,
+            string: xproto::AtomEnum::STRING.into(),
+            text,
+            text_plain_utf8,
+            incr,
+            property,
+        };
+        let screen_size = conn
+            .setup()
+            .roots
+            .get(screen)
+            .map(|s| (s.width_in_pixels, s.height_in_pixels))
+            .unwrap_or((1, 1));
         conn.change_window_attributes(
             root,
             &xproto::ChangeWindowAttributesAux::new()
@@ -262,6 +305,12 @@ impl Session {
             b"FeroStream",
         )
         .map_err(err)?;
+        conn.xfixes_select_selection_input(
+            root,
+            clip.clipboard,
+            xfixes::SelectionEventMask::SET_SELECTION_OWNER,
+        )
+        .map_err(err)?;
         let keyboard = Keyboard::load(&conn)?;
         conn.sync().map_err(err)?;
         Ok(Arc::new(Session {
@@ -270,6 +319,8 @@ impl Session {
             wake_window,
             atoms,
             wm,
+            clip,
+            screen: screen_size,
             dpi,
             state: Mutex::new(State::default()),
             keyboard: Mutex::new(keyboard),
@@ -404,6 +455,30 @@ impl Session {
                 }
             }
             Event::ClientMessage(e) if e.format == 32 => self.client_message(&e)?,
+            Event::XfixesSelectionNotify(e)
+                if e.selection == self.clip.clipboard
+                    && e.owner != self.wake_window
+                    && e.owner != x11rb::NONE =>
+            {
+                // A program copied: ask it for the text as UTF-8.
+                let _ = self.conn.convert_selection(
+                    self.wake_window,
+                    self.clip.clipboard,
+                    self.clip.utf8_string,
+                    self.clip.property,
+                    e.selection_timestamp,
+                );
+                let _ = self.conn.flush();
+            }
+            Event::SelectionNotify(e)
+                if e.requestor == self.wake_window && e.property == self.clip.property =>
+            {
+                self.read_copied()?;
+            }
+            Event::SelectionRequest(e) if e.owner == self.wake_window => self.give_clipboard(&e),
+            Event::SelectionClear(e) if e.selection == self.clip.clipboard => {
+                lock(&self.state).offered = None;
+            }
             _ => {}
         }
         Ok(())
@@ -581,6 +656,157 @@ impl Session {
         out
     }
 
+    /// Reads the text a program handed over after a copy, and passes it on.
+    fn read_copied(&self) -> Result<(), String> {
+        let max = (ferostream_proto::MAX_CLIPBOARD / 4) as u32;
+        let Ok(Ok(r)) = self
+            .conn
+            .get_property(
+                true,
+                self.wake_window,
+                self.clip.property,
+                xproto::AtomEnum::ANY,
+                0,
+                max,
+            )
+            .map(|c| c.reply())
+        else {
+            return Ok(());
+        };
+        // INCR is a transfer in pieces, for text over ~256 KiB; such text is
+        // not passed on, and nor is anything that is not 8-bit text.
+        if r.type_ == self.clip.incr || r.format != 8 || r.bytes_after > 0 {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&r.value).into_owned();
+        let mut st = lock(&self.state);
+        if text.is_empty()
+            || st.sent_clipboard.as_deref() == Some(&text)
+            || st.offered.as_deref() == Some(&text)
+        {
+            return Ok(());
+        }
+        st.sent_clipboard = Some(text.clone());
+        drop(st);
+        self.send(&[Message::Clipboard { text }])
+    }
+
+    /// A program pastes text copied on Windows.
+    fn give_clipboard(&self, e: &xproto::SelectionRequestEvent) {
+        let property = if e.property == x11rb::NONE {
+            e.target
+        } else {
+            e.property
+        };
+        let offered = lock(&self.state).offered.clone();
+        let answer = offered.and_then(|t| clipboard::answer(&self.clip, e.target, &t));
+        let ok = match answer {
+            Some((ty, clipboard::Data::Atoms(atoms))) => self
+                .conn
+                .change_property32(xproto::PropMode::REPLACE, e.requestor, property, ty, &atoms)
+                .is_ok(),
+            Some((ty, clipboard::Data::Text(bytes))) => self
+                .conn
+                .change_property8(xproto::PropMode::REPLACE, e.requestor, property, ty, &bytes)
+                .is_ok(),
+            None => false,
+        };
+        let notify = xproto::SelectionNotifyEvent {
+            response_type: xproto::SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: e.time,
+            requestor: e.requestor,
+            selection: e.selection,
+            target: e.target,
+            property: if ok { property } else { x11rb::NONE },
+        };
+        let _ = self
+            .conn
+            .send_event(false, e.requestor, xproto::EventMask::NO_EVENT, notify);
+        let _ = self.conn.flush();
+    }
+
+    /// Clicks where no window is, so a program with an open menu (which
+    /// holds the pointer) closes it, as clicking elsewhere would.
+    fn close_menus(&self) {
+        let rects: Vec<(i32, i32, u16, u16)> = {
+            let st = lock(&self.state);
+            if !st.windows.values().any(|w| w.popup) {
+                return;
+            }
+            st.windows
+                .values()
+                .map(|w| (i32::from(w.x), i32::from(w.y), w.w, w.h))
+                .collect()
+        };
+        let Some((x, y)) = clipboard::free_point(self.screen.0, self.screen.1, &rects) else {
+            return;
+        };
+        let at = x11rb::CURRENT_TIME;
+        let _ = self
+            .conn
+            .xtest_fake_input(xproto::MOTION_NOTIFY_EVENT, 0, at, self.root, x, y, 0);
+        for kind in [xproto::BUTTON_PRESS_EVENT, xproto::BUTTON_RELEASE_EVENT] {
+            let _ = self.conn.xtest_fake_input(kind, 1, at, self.root, 0, 0, 0);
+        }
+    }
+
+    /// Mirrors the client's screens as RandR monitors, so programs keep
+    /// menus and dialogs on one screen.
+    fn set_monitors(&self, monitors: &[ferostream_proto::Monitor]) {
+        if !self
+            .conn
+            .randr_query_version(1, 5)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|v| v.major_version > 1 || v.minor_version >= 5)
+        {
+            return;
+        }
+        let old = std::mem::take(&mut lock(&self.state).monitors);
+        for name in old {
+            let _ = self.conn.randr_delete_monitor(self.root, name);
+        }
+        // Xvfb has an automatic monitor covering the whole screen, made from
+        // its one output. A monitor that names that output takes its place;
+        // only the first one may, or each would replace the one before.
+        let outputs = self
+            .conn
+            .randr_get_screen_resources_current(self.root)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.outputs)
+            .unwrap_or_default();
+        let mut names = Vec::new();
+        for (i, m) in monitors.iter().enumerate() {
+            let Ok(Ok(name)) = self
+                .conn
+                .intern_atom(false, format!("FEROSTREAM-{i}").as_bytes())
+                .map(|c| c.reply())
+            else {
+                continue;
+            };
+            // Size in millimetres at the session's DPI.
+            let mm = |px: u16| (u32::from(px) * 254 / (u32::from(self.dpi) * 10)).max(1);
+            let info = randr::MonitorInfo {
+                name: name.atom,
+                primary: i == 0,
+                automatic: false,
+                x: m.x.min(i16::MAX as u16) as i16,
+                y: m.y.min(i16::MAX as u16) as i16,
+                width: m.width,
+                height: m.height,
+                width_in_millimeters: mm(m.width),
+                height_in_millimeters: mm(m.height),
+                outputs: if i == 0 { outputs.clone() } else { Vec::new() },
+            };
+            if self.conn.randr_set_monitor(self.root, info).is_ok() {
+                names.push(name.atom);
+            }
+        }
+        lock(&self.state).monitors = names;
+    }
+
     /// Requests programs send to the window manager (to the root window).
     fn client_message(&self, e: &xproto::ClientMessageEvent) -> Result<(), String> {
         let d = e.data.as_data32();
@@ -589,6 +815,9 @@ impl Session {
             Some(w) if !w.popup => w.state,
             _ => return Ok(()),
         };
+        if e.type_ == self.wm.net_active_window {
+            return self.send(&[Message::WindowActivate { window }]);
+        }
         let new = if e.type_ == self.wm.net_wm_state {
             self.wm.apply_state_request(current, d[0], d[1], d[2])
         } else if e.type_ == self.wm.wm_change_state && d[0] == 3 {
@@ -805,6 +1034,14 @@ impl Session {
                     );
                 } else if window == 0 {
                     lock(&self.keyboard).release_all(&self.conn, self.root);
+                    // Like a desktop with the focus in another program: no
+                    // window has it, and open menus close.
+                    let _ = self.conn.set_input_focus(
+                        xproto::InputFocus::NONE,
+                        x11rb::NONE,
+                        x11rb::CURRENT_TIME,
+                    );
+                    self.close_menus();
                 }
             }
             Message::WindowMove {
@@ -838,6 +1075,17 @@ impl Session {
                     self.write_state(window, state);
                 }
             }
+            Message::Clipboard { text } => {
+                lock(&self.state).offered = Some(text);
+                // CLIPBOARD for Ctrl+V; PRIMARY too, for a middle click or
+                // Shift+Insert in xterm.
+                for sel in [self.clip.clipboard, self.clip.primary] {
+                    let _ =
+                        self.conn
+                            .set_selection_owner(self.wake_window, sel, x11rb::CURRENT_TIME);
+                }
+            }
+            Message::Monitors { monitors } => self.set_monitors(&monitors),
             Message::Ping { token } => self.send(&[Message::Pong { token }])?,
             _ => {}
         }

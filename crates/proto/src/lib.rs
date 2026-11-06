@@ -31,7 +31,7 @@ pub mod tile;
 
 /// Protocol version this crate speaks. Both sides send theirs in
 /// [`Message::Hello`]; a side refuses a version it does not know.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// What the agent writes before its first frame.
 pub const PREAMBLE: &[u8] = b"\0FEROSTREAM\n";
@@ -54,6 +54,21 @@ pub const MAX_DPI: u16 = 480;
 
 /// Most program arguments in [`Message::Start`].
 pub const MAX_ARGS: usize = 256;
+
+/// Largest clipboard text, in bytes.
+pub const MAX_CLIPBOARD: usize = 1024 * 1024;
+
+/// Most monitors in [`Message::Monitors`].
+pub const MAX_MONITORS: usize = 16;
+
+/// One screen of the client's desktop, on the virtual screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Monitor {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
 
 /// What kind of window [`Message::WindowNew`] announces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +153,10 @@ pub enum Message {
     /// A window was minimised, maximised, made full screen or restored: by
     /// the user (client to agent) or by the program (agent to client).
     WindowState { window: u32, state: WindowState },
+    /// Text was copied: on Windows (client to agent, sent when the user
+    /// turns to a remote window) or in a program (agent to client). At most
+    /// [`MAX_CLIPBOARD`] bytes.
+    Clipboard { text: String },
 
     // ----- Client to agent -----
     /// Starts a program. `width` x `height` is the size of the virtual
@@ -180,8 +199,13 @@ pub enum Message {
         height: u16,
     },
     /// The window got the keyboard focus. Window 0: the client lost the
-    /// focus to another program; the agent lets go of held keys.
+    /// focus to another program; the agent lets go of held keys and closes
+    /// open menus, as clicking elsewhere on a desktop would.
     Focus { window: u32 },
+    /// Where the client's screens are on the virtual screen, so programs
+    /// keep menus and dialogs on one screen. Sent after
+    /// [`Message::Start`] and whenever the screens change.
+    Monitors { monitors: Vec<Monitor> },
 
     // ----- Agent to client -----
     /// A window appeared.
@@ -216,6 +240,9 @@ pub enum Message {
         max_width: u16,
         max_height: u16,
     },
+    /// The program asks for its window to come to the front (a second
+    /// start of the program, a notification clicked).
+    WindowActivate { window: u32 },
     /// A window's icon, for its title bar and taskbar button: `big` for the
     /// taskbar and Alt+Tab, else the small one in the title bar.
     WindowIcon {
@@ -250,6 +277,7 @@ impl Message {
             Message::Ping { .. } => 2,
             Message::Pong { .. } => 3,
             Message::WindowState { .. } => 4,
+            Message::Clipboard { .. } => 5,
             Message::Start { .. } => 16,
             Message::PointerMove { .. } => 17,
             Message::PointerButton { .. } => 18,
@@ -259,6 +287,7 @@ impl Message {
             Message::WindowClose { .. } => 22,
             Message::WindowMove { .. } => 23,
             Message::Focus { .. } => 24,
+            Message::Monitors { .. } => 25,
             Message::WindowNew { .. } => 64,
             Message::WindowConfigure { .. } => 65,
             Message::WindowTitle { .. } => 66,
@@ -270,6 +299,7 @@ impl Message {
             Message::Cursor { .. } => 72,
             Message::WindowHints { .. } => 73,
             Message::WindowIcon { .. } => 74,
+            Message::WindowActivate { .. } => 75,
         }
     }
 
@@ -287,6 +317,23 @@ impl Message {
             Message::WindowState { window, state } => {
                 w.u32(*window);
                 w.u8(state.to_u8());
+            }
+            Message::Clipboard { text } => {
+                let mut end = text.len().min(MAX_CLIPBOARD);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                w.bytes(text.as_bytes().get(..end).unwrap_or_default());
+            }
+            Message::Monitors { monitors } => {
+                let n = monitors.len().min(MAX_MONITORS);
+                w.u32(n as u32);
+                for m in monitors.iter().take(n) {
+                    w.u16(m.x);
+                    w.u16(m.y);
+                    w.u16(m.width);
+                    w.u16(m.height);
+                }
             }
             Message::Start {
                 width,
@@ -330,6 +377,7 @@ impl Message {
                 w.u32(*seq);
             }
             Message::WindowClose { window }
+            | Message::WindowActivate { window }
             | Message::Focus { window }
             | Message::WindowGone { window } => w.u32(*window),
             Message::WindowMove {
@@ -441,6 +489,15 @@ impl Message {
                 window: r.u32()?,
                 state: WindowState::from_u8(r.u8()?)?,
             },
+            5 => {
+                let b = r.bytes()?;
+                if b.len() > MAX_CLIPBOARD {
+                    return Err(Error::TooBig);
+                }
+                Message::Clipboard {
+                    text: String::from_utf8(b.to_vec()).map_err(|_| Error::Invalid("UTF-8"))?,
+                }
+            }
             16 => {
                 let width = r.side()?;
                 let height = r.side()?;
@@ -495,6 +552,28 @@ impl Message {
                 height: r.side()?,
             },
             24 => Message::Focus { window: r.u32()? },
+            25 => {
+                let n = r.u32()? as usize;
+                if n == 0 || n > MAX_MONITORS {
+                    return Err(Error::Invalid("monitor count"));
+                }
+                let mut monitors = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let m = Monitor {
+                        x: r.u16()?,
+                        y: r.u16()?,
+                        width: r.side()?,
+                        height: r.side()?,
+                    };
+                    if u32::from(m.x) + u32::from(m.width) > u32::from(MAX_WINDOW_SIDE)
+                        || u32::from(m.y) + u32::from(m.height) > u32::from(MAX_WINDOW_SIDE)
+                    {
+                        return Err(Error::Invalid("monitor"));
+                    }
+                    monitors.push(m);
+                }
+                Message::Monitors { monitors }
+            }
             64 => Message::WindowNew {
                 window: r.u32()?,
                 x: r.i32()?,
@@ -573,6 +652,7 @@ impl Message {
                     max_height: limit()?,
                 }
             }
+            75 => Message::WindowActivate { window: r.u32()? },
             74 => Message::WindowIcon {
                 window: r.u32()?,
                 big: r.bool()?,
@@ -889,6 +969,26 @@ mod tests {
                 big: true,
                 image: image::Image::new(32, 32, &[2; 32 * 32 * 4]),
             },
+            Message::Clipboard {
+                text: "copied — ✓".into(),
+            },
+            Message::Monitors {
+                monitors: vec![
+                    Monitor {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    },
+                    Monitor {
+                        x: 1920,
+                        y: 0,
+                        width: 1280,
+                        height: 1024,
+                    },
+                ],
+            },
+            Message::WindowActivate { window: 3 },
             Message::Exited { code: -1 },
             Message::Error {
                 message: "Xvfb is not installed".into(),

@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ferostream_proto::{FrameReader, Message, VERSION, WindowKind, WindowState};
+use ferostream_proto::{FrameReader, Message, Monitor, VERSION, WindowKind, WindowState};
 
 /// Set for programs the agent starts in these tests: it lets the
 /// [`helper_window`] test run when this test binary is that program.
@@ -428,6 +428,313 @@ fn window_manager_requests() {
     for (_, width, px) in &icons {
         assert_eq!(*width, 32);
         assert_eq!(&px[..4], &[0, 0xff, 0, 0x80]);
+    }
+    drop(a.child.stdin.take());
+    let _ = a.child.wait();
+}
+
+/// Not a test of its own: the program [`clipboard_monitors_and_activation`]
+/// runs on the agent's display. It pastes until it gets the text copied
+/// "on Windows", reports the monitors it sees in its title, asks to be
+/// brought to the front, and then copies text of its own.
+#[test]
+#[ignore = "runs inside the agent, started by clipboard_monitors_and_activation"]
+fn helper_clipboard() {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::randr::ConnectionExt as _;
+    use x11rb::protocol::xproto::{self, ConnectionExt as _};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    if std::env::var_os(HELPER).is_none() {
+        return;
+    }
+    let (conn, screen) = x11rb::connect(None).unwrap();
+    let root = conn.setup().roots[screen].root;
+    let atom = |name: &str| {
+        conn.intern_atom(false, name.as_bytes())
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom
+    };
+    let (clipboard, utf8, prop) = (atom("CLIPBOARD"), atom("UTF8_STRING"), atom("HELPER_PASTE"));
+    let win = conn.generate_id().unwrap();
+    conn.create_window(
+        0,
+        win,
+        root,
+        10,
+        10,
+        120,
+        80,
+        0,
+        xproto::WindowClass::INPUT_OUTPUT,
+        0,
+        &xproto::CreateWindowAux::new()
+            .background_pixel(0x0066_9933)
+            .event_mask(xproto::EventMask::PROPERTY_CHANGE),
+    )
+    .unwrap();
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+
+    // Paste until the agent offers the text.
+    let pasted = loop {
+        conn.convert_selection(win, clipboard, utf8, prop, x11rb::CURRENT_TIME)
+            .unwrap();
+        conn.flush().unwrap();
+        let got = loop {
+            match conn.wait_for_event().unwrap() {
+                Event::SelectionNotify(e) if e.property == x11rb::NONE => break None,
+                Event::SelectionNotify(_) => {
+                    let r = conn
+                        .get_property(true, win, prop, xproto::AtomEnum::ANY, 0, 4096)
+                        .unwrap()
+                        .reply()
+                        .unwrap();
+                    break Some(String::from_utf8(r.value).unwrap());
+                }
+                _ => {}
+            }
+        };
+        if let Some(t) = got.filter(|t| t.starts_with("from windows")) {
+            break t;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let monitors = conn
+        .randr_get_monitors(root, true)
+        .unwrap()
+        .reply()
+        .map_or(0, |r| r.monitors.len());
+    conn.change_property8(
+        xproto::PropMode::REPLACE,
+        win,
+        xproto::AtomEnum::WM_NAME,
+        xproto::AtomEnum::STRING,
+        format!("pasted {} monitors={monitors}", pasted.len()).as_bytes(),
+    )
+    .unwrap();
+    let ev = xproto::ClientMessageEvent::new(32, win, atom("_NET_ACTIVE_WINDOW"), [1, 0, 0, 0, 0]);
+    conn.send_event(
+        false,
+        root,
+        xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+        ev,
+    )
+    .unwrap();
+
+    // Copy, and hand the text to whoever asks.
+    let mine = "from linux ✓";
+    conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)
+        .unwrap();
+    conn.flush().unwrap();
+    while let Ok(ev) = conn.wait_for_event() {
+        if let Event::SelectionRequest(e) = ev {
+            let ok = e.target == utf8;
+            if ok {
+                conn.change_property8(
+                    xproto::PropMode::REPLACE,
+                    e.requestor,
+                    e.property,
+                    utf8,
+                    mine.as_bytes(),
+                )
+                .unwrap();
+            }
+            let notify = xproto::SelectionNotifyEvent {
+                response_type: xproto::SELECTION_NOTIFY_EVENT,
+                sequence: 0,
+                time: e.time,
+                requestor: e.requestor,
+                selection: e.selection,
+                target: e.target,
+                property: if ok { e.property } else { x11rb::NONE },
+            };
+            conn.send_event(false, e.requestor, xproto::EventMask::NO_EVENT, notify)
+                .unwrap();
+            conn.flush().unwrap();
+        }
+    }
+}
+
+#[test]
+fn clipboard_monitors_and_activation() {
+    if !have("Xvfb") {
+        assert!(std::env::var_os("FEROSTREAM_REQUIRE_X").is_none());
+        return;
+    }
+    let me = std::env::current_exe().unwrap();
+    let me = me.to_str().unwrap();
+    let mut a = Agent::start(&[
+        me,
+        "--exact",
+        "helper_clipboard",
+        "--ignored",
+        "--nocapture",
+    ]);
+    let window = loop {
+        match a.next() {
+            Message::WindowNew { window, .. } => break window,
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
+    };
+    a.send(Message::Monitors {
+        monitors: vec![
+            Monitor {
+                x: 0,
+                y: 0,
+                width: 512,
+                height: 768,
+            },
+            Monitor {
+                x: 512,
+                y: 0,
+                width: 512,
+                height: 768,
+            },
+        ],
+    });
+    let copied = "from windows — ✓";
+    a.send(Message::Clipboard {
+        text: copied.into(),
+    });
+    let (mut title, mut activated, mut clip) = (None, false, None);
+    while title.is_none() || !activated || clip.is_none() {
+        match a.next() {
+            Message::WindowTitle {
+                window: w,
+                title: t,
+            } if w == window => title = Some(t),
+            Message::WindowActivate { window: w } if w == window => activated = true,
+            Message::Clipboard { text } => clip = Some(text),
+            Message::FrameEnd { window: fw, seq } => a.send(Message::FrameAck { window: fw, seq }),
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        title.unwrap(),
+        format!("pasted {} monitors=2", copied.len())
+    );
+    assert_eq!(clip.unwrap(), "from linux ✓");
+    drop(a.child.stdin.take());
+    let _ = a.child.wait();
+}
+
+/// Not a test of its own: the program [`menus_close_when_focus_leaves`]
+/// runs. It opens a "menu" (an override-redirect window holding the
+/// pointer, as menus do) and closes it on a click outside it.
+#[test]
+#[ignore = "runs inside the agent, started by menus_close_when_focus_leaves"]
+fn helper_menu() {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xproto::{self, ConnectionExt as _};
+
+    if std::env::var_os(HELPER).is_none() {
+        return;
+    }
+    let (conn, screen) = x11rb::connect(None).unwrap();
+    let root = conn.setup().roots[screen].root;
+    let make = |x, y, w, h, popup: bool| {
+        let id = conn.generate_id().unwrap();
+        conn.create_window(
+            0,
+            id,
+            root,
+            x,
+            y,
+            w,
+            h,
+            0,
+            xproto::WindowClass::INPUT_OUTPUT,
+            0,
+            &xproto::CreateWindowAux::new()
+                .background_pixel(0x00cc_cccc)
+                .override_redirect(u32::from(popup)),
+        )
+        .unwrap();
+        conn.map_window(id).unwrap();
+        id
+    };
+    let _main = make(100, 100, 300, 200, false);
+    let menu = make(120, 130, 100, 80, true);
+    conn.flush().unwrap();
+    // Grab once the menu is viewable.
+    loop {
+        let r = conn
+            .grab_pointer(
+                false,
+                menu,
+                xproto::EventMask::BUTTON_PRESS,
+                xproto::GrabMode::ASYNC,
+                xproto::GrabMode::ASYNC,
+                x11rb::NONE,
+                x11rb::NONE,
+                x11rb::CURRENT_TIME,
+            )
+            .unwrap()
+            .reply()
+            .unwrap();
+        if r.status == xproto::GrabStatus::SUCCESS {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    while let Ok(ev) = conn.wait_for_event() {
+        if let Event::ButtonPress(e) = ev {
+            let inside =
+                e.event == menu && (0..100).contains(&e.event_x) && (0..80).contains(&e.event_y);
+            if !inside {
+                conn.unmap_window(menu).unwrap();
+                conn.ungrab_pointer(x11rb::CURRENT_TIME).unwrap();
+                conn.flush().unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn menus_close_when_focus_leaves() {
+    if !have("Xvfb") {
+        assert!(std::env::var_os("FEROSTREAM_REQUIRE_X").is_none());
+        return;
+    }
+    let me = std::env::current_exe().unwrap();
+    let me = me.to_str().unwrap();
+    let mut a = Agent::start(&[me, "--exact", "helper_menu", "--ignored", "--nocapture"]);
+    let (mut main, mut menu) = (None, None);
+    while main.is_none() || menu.is_none() {
+        match a.next() {
+            Message::WindowNew {
+                window,
+                kind: WindowKind::Popup,
+                ..
+            } => menu = Some(window),
+            Message::WindowNew { window, .. } => main = Some(window),
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
+    }
+    // Give the helper a moment to take the pointer, then switch away.
+    std::thread::sleep(Duration::from_millis(300));
+    a.send(Message::Focus {
+        window: main.unwrap(),
+    });
+    a.send(Message::Focus { window: 0 });
+    loop {
+        match a.next() {
+            Message::WindowGone { window } if Some(window) == menu => break,
+            Message::WindowGone { window } if Some(window) == main => {
+                panic!("the main window went away instead of the menu")
+            }
+            Message::FrameEnd { window: fw, seq } => a.send(Message::FrameAck { window: fw, seq }),
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
     }
     drop(a.child.stdin.take());
     let _ = a.child.wait();
