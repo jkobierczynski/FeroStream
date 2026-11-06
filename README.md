@@ -26,11 +26,17 @@ will.
 
 ## Status
 
-Step 1 of the [plan](https://claude.ai/artifact/256vVGrd767CWXCAcpPEd1):
-windows appear, pixels stream (LZ4 tiles), mouse and keyboard work, titles
-follow, and closing the window or exiting the program ends the session. Not
-yet: clipboard, HiDPI scaling, cursor shapes, smarter compression, QUIC,
-reattaching to a running session.
+Step 1 of the [plan](https://claude.ai/artifact/256vVGrd767CWXCAcpPEd1) and
+part of step 2: windows appear, pixels stream (LZ4 tiles), mouse and keyboard
+work, titles follow, text is sized for your screen's scaling, the pointer
+takes the program's shapes, and closing the window or exiting the program
+ends the session. Not yet: clipboard, taskbar icons, smarter compression,
+QUIC, reattaching to a running session.
+
+Typing goes through your Windows keyboard layout: the client sends the
+characters Windows produces (dead keys and AltGr included), so the host
+needs no matching layout. Keys without text (arrows, F-keys) and shortcuts
+(Ctrl+C, Alt+F) go as key names.
 
 ## Trying it
 

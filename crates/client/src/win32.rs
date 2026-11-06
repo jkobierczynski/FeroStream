@@ -108,6 +108,9 @@ struct App {
     /// left Ctrl Windows adds goes to the agent.
     altgr: bool,
     high_surrogate: Option<u16>,
+    /// The remote pointer shape, shown over every remote window; `None`
+    /// until the agent sends one (the arrow until then).
+    cursor: Option<HCURSOR>,
     ended: bool,
     exit_code: i32,
     problem: Option<String>,
@@ -255,6 +258,7 @@ pub fn run(options: Options) -> ExitCode {
             chords: HashMap::new(),
             altgr: false,
             high_surrogate: None,
+            cursor: None,
             ended: false,
             exit_code: 0,
             problem: None,
@@ -392,6 +396,11 @@ impl App {
                 }
                 self.link.send(Message::FrameAck { window, seq });
             }
+            Message::Cursor {
+                hot_x,
+                hot_y,
+                image,
+            } => self.set_cursor(crate::picture::cursor(hot_x, hot_y, &image)),
             Message::Ping { token } => self.link.send(Message::Pong { token }),
             Message::Exited { code } => {
                 self.ended = true;
@@ -504,6 +513,27 @@ impl App {
                 height,
             });
             self.link.send(Message::Focus { window });
+        }
+    }
+
+    /// Takes a new pointer shape, showing it at once when the pointer is
+    /// over one of our windows.
+    fn set_cursor(&mut self, new: Option<HCURSOR>) {
+        let Some(new) = new else { return };
+        let mut p = POINT::default();
+        let over_ours = unsafe { GetCursorPos(&mut p) }.is_ok()
+            && self
+                .by_hwnd
+                .contains_key(&(unsafe { WindowFromPoint(p) }.0 as isize));
+        if over_ours {
+            unsafe {
+                SetCursor(Some(new));
+            }
+        }
+        if let Some(old) = self.cursor.replace(new) {
+            unsafe {
+                let _ = DestroyCursor(old);
+            }
         }
     }
 
@@ -681,6 +711,13 @@ fn on_window(
             Some(LRESULT(0))
         }
         WM_ERASEBKGND => Some(LRESULT(1)),
+        WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT => {
+            let cursor = app.cursor?;
+            unsafe {
+                SetCursor(Some(cursor));
+            }
+            Some(LRESULT(1))
+        }
         WM_MOUSEMOVE => {
             let (x, y) = (lo(lparam), hi(lparam));
             if let Some(r) = app.windows.get_mut(&id) {
@@ -771,6 +808,9 @@ fn on_window(
             // Alt+F4 closes the window, as everywhere on Windows.
             if vk == 0x73 && down(0x12) {
                 return None;
+            }
+            if keys::is_lock_key(vk) {
+                return Some(LRESULT(0));
             }
             // AltGr: Windows sends a left Ctrl just before the right Alt,
             // with the same time stamp. Neither goes to the agent; the

@@ -15,7 +15,6 @@ pub fn special_keysym(vk: u16, extended: bool) -> Option<u32> {
         0x0d if extended => 0xff8d,                   // KP_Enter
         0x0d => 0xff0d,                               // Return
         0x13 => 0xff13,                               // Pause
-        0x14 => 0xffe5,                               // Caps_Lock
         0x1b => 0xff1b,                               // Escape
         0x21 => 0xff55,                               // Prior (Page Up)
         0x22 => 0xff56,                               // Next (Page Down)
@@ -32,8 +31,6 @@ pub fn special_keysym(vk: u16, extended: bool) -> Option<u32> {
         0x5c => 0xffec,                               // Super_R
         0x5d => 0xff67,                               // Menu
         0x70..=0x87 => 0xffbe + u32::from(vk - 0x70), // F1 .. F24
-        0x90 => 0xff7f,                               // Num_Lock
-        0x91 => 0xff14,                               // Scroll_Lock
         0xa0 => 0xffe1,                               // Shift_L
         0xa1 => 0xffe2,                               // Shift_R
         0xa2 => 0xffe3,                               // Control_L
@@ -50,6 +47,14 @@ pub fn special_keysym(vk: u16, extended: bool) -> Option<u32> {
         _ => return None,
     };
     Some(ks)
+}
+
+/// Caps Lock, Num Lock and Scroll Lock stay on the Windows side: Windows
+/// already applies them to the characters it reports, and a lock switched
+/// on at the agent as well would apply twice (Caps Lock plus the Shift the
+/// agent adds for a capital gives a small letter).
+pub fn is_lock_key(vk: u16) -> bool {
+    matches!(vk, 0x14 | 0x90 | 0x91)
 }
 
 /// The keysym for a letter, digit or punctuation key pressed with Ctrl or
@@ -98,6 +103,11 @@ mod tests {
         assert_eq!(special_keysym(0x70, false), Some(0xffbe));
         assert_eq!(special_keysym(0x87, false), Some(0xffbe + 23));
         assert_eq!(special_keysym(0x41, false), None);
+        // Lock keys never reach the agent.
+        for vk in [0x14, 0x90, 0x91] {
+            assert!(is_lock_key(vk));
+            assert_eq!(special_keysym(vk, false), None);
+        }
     }
 
     #[test]

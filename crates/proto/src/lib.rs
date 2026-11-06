@@ -26,11 +26,12 @@
 
 use std::fmt;
 
+pub mod image;
 pub mod tile;
 
 /// Protocol version this crate speaks. Both sides send theirs in
 /// [`Message::Hello`]; a side refuses a version it does not know.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// What the agent writes before its first frame.
 pub const PREAMBLE: &[u8] = b"\0FEROSTREAM\n";
@@ -145,6 +146,13 @@ pub enum Message {
     WindowTitle { window: u32, title: String },
     /// A window went away (closed or hidden).
     WindowGone { window: u32 },
+    /// The pointer shape changed: show `image` over every window from now
+    /// on, with its hot spot (the pixel that points) at `hot_x`,`hot_y`.
+    Cursor {
+        hot_x: u16,
+        hot_y: u16,
+        image: image::Image,
+    },
     /// New pixels for a rectangle of a window; see [`tile`].
     Tile(tile::Tile),
     /// The tiles sent so far for `window` make a whole picture; draw it and
@@ -179,6 +187,7 @@ impl Message {
             Message::FrameEnd { .. } => 69,
             Message::Exited { .. } => 70,
             Message::Error { .. } => 71,
+            Message::Cursor { .. } => 72,
         }
     }
 
@@ -294,6 +303,15 @@ impl Message {
             }
             Message::Exited { code } => w.i32(*code),
             Message::Error { message } => w.str(message),
+            Message::Cursor {
+                hot_x,
+                hot_y,
+                image,
+            } => {
+                w.u16(*hot_x);
+                w.u16(*hot_y);
+                w.image(image);
+            }
         }
         let mut out = w.0;
         let len = (out.len() - 4) as u32;
@@ -424,6 +442,19 @@ impl Message {
             },
             70 => Message::Exited { code: r.i32()? },
             71 => Message::Error { message: r.str()? },
+            72 => {
+                let hot_x = r.u16()?;
+                let hot_y = r.u16()?;
+                let image = r.image()?;
+                if hot_x >= image.width || hot_y >= image.height {
+                    return Err(Error::Invalid("cursor hot spot"));
+                }
+                Message::Cursor {
+                    hot_x,
+                    hot_y,
+                    image,
+                }
+            }
             _ => return Err(Error::UnknownTag(tag)),
         };
         if !r.0.is_empty() {
@@ -490,6 +521,11 @@ impl Writer {
         self.u32(b.len() as u32);
         self.0.extend_from_slice(b);
     }
+    fn image(&mut self, i: &image::Image) {
+        self.u16(i.width);
+        self.u16(i.height);
+        self.bytes(&i.data);
+    }
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -547,6 +583,15 @@ impl<'a> Reader<'a> {
             return Err(Error::TooBig);
         }
         String::from_utf8(b.to_vec()).map_err(|_| Error::Invalid("UTF-8"))
+    }
+    fn image(&mut self) -> Result<image::Image, Error> {
+        let i = image::Image {
+            width: self.u16()?,
+            height: self.u16()?,
+            data: self.bytes()?.to_vec(),
+        };
+        i.check()?;
+        Ok(i)
     }
 }
 
@@ -700,6 +745,11 @@ mod tests {
             Message::WindowGone { window: 3 },
             Message::Tile(tile::Tile::lz4(3, 0, 0, 2, 2, &[9; 16])),
             Message::FrameEnd { window: 3, seq: 9 },
+            Message::Cursor {
+                hot_x: 3,
+                hot_y: 4,
+                image: image::Image::new(16, 16, &[1; 16 * 16 * 4]),
+            },
             Message::Exited { code: -1 },
             Message::Error {
                 message: "Xvfb is not installed".into(),

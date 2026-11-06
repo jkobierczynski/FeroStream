@@ -13,4 +13,6 @@ pub mod transport;
 #[cfg(windows)]
 pub mod askpass;
 #[cfg(windows)]
+pub mod picture;
+#[cfg(windows)]
 pub mod win32;

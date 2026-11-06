@@ -5,6 +5,7 @@
 //! keeps all its pixels even where others overlap it. Damage reports what
 //! changed; GetImage reads it back; the tiles go to the client LZ4-packed.
 //! There is no window manager: windows sit where the client puts them.
+//! XFixes reports pointer-shape changes, which go to the client as images.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -12,13 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use ferostream_proto::image::{self, Image, MAX_IMAGE_SIDE};
 use ferostream_proto::tile::{MAX_TILE_SIDE, Tile};
 use ferostream_proto::{MAX_WINDOW_SIDE, Message, WindowKind};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::{self, ConnectionExt as _};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
-use x11rb::protocol::xfixes::ConnectionExt as _;
+use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -76,6 +78,8 @@ impl Win {
 struct State {
     windows: BTreeMap<u32, Win>,
     exited: Option<i32>,
+    /// XFixes serial of the pointer shape last sent.
+    cursor: Option<u32>,
 }
 
 /// Writes frames to the client.
@@ -194,6 +198,8 @@ impl Session {
         )
         .map_err(err)?;
         conn.composite_redirect_subwindows(root, composite::Redirect::MANUAL)
+            .map_err(err)?;
+        conn.xfixes_select_cursor_input(root, xfixes::CursorNotifyMask::DISPLAY_CURSOR)
             .map_err(err)?;
         // An unmapped InputOnly window the input thread sends ClientMessages
         // to, to wake the event thread (an acknowledged frame, a stop).
@@ -333,6 +339,9 @@ impl Session {
                     });
                 }
             }
+            Event::XfixesCursorNotify(e) if lock(&self.state).cursor != Some(e.cursor_serial) => {
+                self.send_cursor()?;
+            }
             Event::PropertyNotify(e)
                 if (e.atom == self.atoms.net_wm_name
                     || e.atom == u32::from(xproto::AtomEnum::WM_NAME))
@@ -400,6 +409,29 @@ impl Session {
             kind,
             transient_for,
             title,
+        }])
+    }
+
+    /// Sends the pointer shape the display shows now.
+    fn send_cursor(&self) -> Result<(), String> {
+        let Ok(Ok(c)) = self.conn.xfixes_get_cursor_image().map(|c| c.reply()) else {
+            return Ok(());
+        };
+        let count = usize::from(c.width) * usize::from(c.height);
+        if c.width == 0
+            || c.height == 0
+            || c.width > MAX_IMAGE_SIDE
+            || c.height > MAX_IMAGE_SIDE
+            || c.cursor_image.len() != count
+        {
+            return Ok(());
+        }
+        lock(&self.state).cursor = Some(c.cursor_serial);
+        let pixels = image::from_premultiplied_argb(&c.cursor_image);
+        self.send(&[Message::Cursor {
+            hot_x: c.xhot.min(c.width - 1),
+            hot_y: c.yhot.min(c.height - 1),
+            image: Image::new(c.width, c.height, &pixels),
         }])
     }
 

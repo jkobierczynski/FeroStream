@@ -1,5 +1,6 @@
 //! Everything a client decodes from an agent it does not trust: the
-//! preamble scan, frame splitting, every message, and every tile's pixels.
+//! preamble scan, frame splitting, every message, and every tile's and
+//! image's pixels.
 
 #![no_main]
 
@@ -28,6 +29,11 @@ fn drain(reader: &mut FrameReader) {
         if let Message::Tile(t) = &m {
             if let Ok(px) = t.decode() {
                 assert_eq!(px.len(), t.pixel_bytes());
+            }
+        }
+        if let Message::Cursor { image, .. } = &m {
+            if let Ok(px) = image.decode() {
+                assert_eq!(px.len(), image.pixel_bytes());
             }
         }
         // What decodes must encode back to the same message.

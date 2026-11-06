@@ -133,7 +133,10 @@ fn wait_for_socket(display: u32, child: &mut Child) -> Result<(), String> {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!("Xvfb on :{display} stopped at start ({status})"));
         }
-        if UnixStream::connect(&path).is_ok() {
+        // Another Xvfb may have taken the same number a moment earlier (two
+        // sessions starting at once); the socket is ours only when the lock
+        // file names our process.
+        if lock_owner(display) == Some(child.id()) && UnixStream::connect(&path).is_ok() {
             return Ok(());
         }
         if Instant::now() > deadline {
@@ -141,6 +144,15 @@ fn wait_for_socket(display: u32, child: &mut Child) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// The process id in a display's lock file.
+fn lock_owner(display: u32) -> Option<u32> {
+    fs::read_to_string(format!("/tmp/.X{display}-lock"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// A fresh directory only this user can enter, under `$XDG_RUNTIME_DIR` when

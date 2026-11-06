@@ -233,3 +233,48 @@ fn text_grows_with_the_client_dpi() {
     let (w, _) = first_window(&["sh", "-c", check], 192);
     assert!(w > 1);
 }
+
+#[test]
+fn pointer_shape_follows_the_window_under_it() {
+    if !(have("Xvfb") && have("xterm")) {
+        assert!(std::env::var_os("FEROSTREAM_REQUIRE_X").is_none());
+        return;
+    }
+    let mut a = Agent::start(&["xterm", "-geometry", "40x10"]);
+    let window = loop {
+        match a.next() {
+            Message::WindowNew {
+                window,
+                kind: WindowKind::Normal,
+                ..
+            } => break window,
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
+    };
+    a.send(Message::PointerMove {
+        window,
+        x: 30,
+        y: 30,
+    });
+    // xterm shows a text (I-beam) pointer: a picture with both see-through
+    // and solid pixels, its hot spot inside it.
+    let (hot_x, hot_y, image) = loop {
+        match a.next() {
+            Message::Cursor {
+                hot_x,
+                hot_y,
+                image,
+            } => break (hot_x, hot_y, image),
+            Message::FrameEnd { window: fw, seq } => a.send(Message::FrameAck { window: fw, seq }),
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
+    };
+    let px = image.decode().unwrap();
+    assert!(hot_x < image.width && hot_y < image.height);
+    assert!(px.chunks(4).any(|p| p[3] == 0));
+    assert!(px.chunks(4).any(|p| p[3] == 255));
+    drop(a.child.stdin.take());
+    let _ = a.child.wait();
+}
