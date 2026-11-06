@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use ferostream_proto::tile::{MAX_TILE_SIDE, Tile};
 use ferostream_proto::{MAX_WINDOW_SIDE, Message, WindowKind};
@@ -31,6 +33,12 @@ const MAX_IN_FLIGHT: u32 = 2;
 /// More damaged rectangles than this in one window are sent as their
 /// bounding box.
 const MAX_RECTS: usize = 32;
+
+/// Drawing must pause this long before pixels are read...
+const SETTLE_QUIET: Duration = Duration::from_millis(4);
+/// ...but a program that never pauses (an animation) is read at least this
+/// often.
+const SETTLE_MAX: Duration = Duration::from_millis(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rect {
@@ -102,6 +110,8 @@ pub struct Session {
     state: Mutex<State>,
     keyboard: Mutex<Keyboard>,
     out: Mutex<Box<dyn Sink>>,
+    /// Damage arrived since the event loop last looked.
+    fresh_damage: AtomicBool,
 }
 
 impl std::fmt::Debug for Session {
@@ -212,6 +222,7 @@ impl Session {
             state: Mutex::new(State::default()),
             keyboard: Mutex::new(keyboard),
             out: Mutex::new(out),
+            fresh_damage: AtomicBool::new(false),
         }))
     }
 
@@ -248,8 +259,20 @@ impl Session {
         loop {
             let ev = self.conn.wait_for_event().map_err(err)?;
             self.handle(ev)?;
-            while let Some(ev) = self.conn.poll_for_event().map_err(err)? {
-                self.handle(ev)?;
+            // A program often draws one picture in several steps (clear,
+            // background, layers). Reading pixels between steps would send a
+            // half-drawn frame, so wait until drawing pauses briefly.
+            let started = Instant::now();
+            loop {
+                while let Some(ev) = self.conn.poll_for_event().map_err(err)? {
+                    self.handle(ev)?;
+                }
+                if !self.fresh_damage.swap(false, Ordering::Relaxed)
+                    || started.elapsed() >= SETTLE_MAX
+                {
+                    break;
+                }
+                std::thread::sleep(SETTLE_QUIET);
             }
             self.flush_damage()?;
             let st = lock(&self.state);
@@ -299,6 +322,7 @@ impl Session {
                 }
             }
             Event::DamageNotify(e) => {
+                self.fresh_damage.store(true, Ordering::Relaxed);
                 let mut st = lock(&self.state);
                 if let Some(w) = st.windows.get_mut(&e.drawable) {
                     w.dirty.push(Rect {
