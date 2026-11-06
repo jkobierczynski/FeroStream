@@ -15,7 +15,11 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ferostream_proto::{FrameReader, Message, VERSION, WindowKind};
+use ferostream_proto::{FrameReader, Message, VERSION, WindowKind, WindowState};
+
+/// Set for programs the agent starts in these tests: it lets the
+/// [`helper_window`] test run when this test binary is that program.
+const HELPER: &str = "FEROSTREAM_TEST_HELPER";
 
 fn have(program: &str) -> bool {
     Command::new("sh")
@@ -38,6 +42,7 @@ impl Agent {
     fn start_at(argv: &[&str], dpi: u16) -> Agent {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferostream-agent"))
             .arg("--stdio")
+            .env(HELPER, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -275,6 +280,154 @@ fn pointer_shape_follows_the_window_under_it() {
     assert!(hot_x < image.width && hot_y < image.height);
     assert!(px.chunks(4).any(|p| p[3] == 0));
     assert!(px.chunks(4).any(|p| p[3] == 255));
+    drop(a.child.stdin.take());
+    let _ = a.child.wait();
+}
+
+/// Not a test of its own: the program [`window_manager_requests`] runs on
+/// the agent's display. It shows a dialog with size limits and icons, then
+/// asks the "window manager" for full screen, as a program would.
+#[test]
+#[ignore = "runs inside the agent, started by window_manager_requests"]
+fn helper_window() {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{self, ConnectionExt as _};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    if std::env::var_os(HELPER).is_none() {
+        return;
+    }
+    let (conn, screen) = x11rb::connect(None).unwrap();
+    let root = conn.setup().roots[screen].root;
+    let atom = |name: &str| {
+        conn.intern_atom(false, name.as_bytes())
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom
+    };
+    let win = conn.generate_id().unwrap();
+    conn.create_window(
+        0,
+        win,
+        root,
+        50,
+        60,
+        200,
+        100,
+        0,
+        xproto::WindowClass::INPUT_OUTPUT,
+        0,
+        &xproto::CreateWindowAux::new().background_pixel(0x0033_6699),
+    )
+    .unwrap();
+    conn.change_property32(
+        xproto::PropMode::REPLACE,
+        win,
+        atom("_NET_WM_WINDOW_TYPE"),
+        xproto::AtomEnum::ATOM,
+        &[atom("_NET_WM_WINDOW_TYPE_DIALOG")],
+    )
+    .unwrap();
+    let mut hints = [0u32; 18];
+    hints[0] = 16 | 32;
+    hints[5] = 150;
+    hints[6] = 80;
+    hints[7] = 400;
+    hints[8] = 300;
+    conn.change_property32(
+        xproto::PropMode::REPLACE,
+        win,
+        xproto::AtomEnum::WM_NORMAL_HINTS,
+        xproto::AtomEnum::WM_SIZE_HINTS,
+        &hints,
+    )
+    .unwrap();
+    let mut icon = vec![16, 16];
+    icon.extend(std::iter::repeat_n(0xffff_0000u32, 256));
+    icon.extend([32, 32]);
+    icon.extend(std::iter::repeat_n(0x8000_ff00u32, 1024));
+    conn.change_property32(
+        xproto::PropMode::REPLACE,
+        win,
+        atom("_NET_WM_ICON"),
+        xproto::AtomEnum::CARDINAL,
+        &icon,
+    )
+    .unwrap();
+    conn.map_window(win).unwrap();
+    conn.sync().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let ev = xproto::ClientMessageEvent::new(
+        32,
+        win,
+        atom("_NET_WM_STATE"),
+        [1, atom("_NET_WM_STATE_FULLSCREEN"), 0, 1, 0],
+    );
+    conn.send_event(
+        false,
+        root,
+        xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+        ev,
+    )
+    .unwrap();
+    conn.flush().unwrap();
+    // Stay until the display goes away.
+    while conn.wait_for_event().is_ok() {}
+}
+
+#[test]
+fn window_manager_requests() {
+    if !have("Xvfb") {
+        assert!(std::env::var_os("FEROSTREAM_REQUIRE_X").is_none());
+        return;
+    }
+    let me = std::env::current_exe().unwrap();
+    let me = me.to_str().unwrap();
+    let mut a = Agent::start_at(
+        &[me, "--exact", "helper_window", "--ignored", "--nocapture"],
+        192,
+    );
+    let mut window = 0;
+    let mut hints = None;
+    let mut icons = Vec::new();
+    let mut full = false;
+    while !(full && hints.is_some() && icons.len() == 2) {
+        match a.next() {
+            Message::WindowNew {
+                window: w, kind, ..
+            } => {
+                assert_eq!(kind, WindowKind::Dialog);
+                window = w;
+            }
+            Message::WindowHints {
+                window: w,
+                min_width,
+                min_height,
+                max_width,
+                max_height,
+            } if w == window => hints = Some((min_width, min_height, max_width, max_height)),
+            Message::WindowIcon {
+                window: w,
+                big,
+                image,
+            } if w == window => icons.push((big, image.width, image.decode().unwrap())),
+            Message::WindowState {
+                window: w,
+                state: WindowState::Fullscreen,
+            } if w == window => full = true,
+            Message::FrameEnd { window: fw, seq } => a.send(Message::FrameAck { window: fw, seq }),
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(hints, Some((150, 80, 400, 300)));
+    // At 200 %: a 64-pixel taskbar icon wanted, the 32 one is the biggest;
+    // a 32-pixel title-bar icon wanted, the 32 one fits exactly.
+    for (_, width, px) in &icons {
+        assert_eq!(*width, 32);
+        assert_eq!(&px[..4], &[0, 0xff, 0, 0x80]);
+    }
     drop(a.child.stdin.take());
     let _ = a.child.wait();
 }

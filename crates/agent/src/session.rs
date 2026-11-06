@@ -4,7 +4,9 @@
 //! Every top-level window is redirected off-screen (Composite), so each one
 //! keeps all its pixels even where others overlap it. Damage reports what
 //! changed; GetImage reads it back; the tiles go to the client LZ4-packed.
-//! There is no window manager: windows sit where the client puts them.
+//! There is no real window manager: windows sit where the client puts them.
+//! The agent does answer the questions programs ask one (EWMH): window
+//! types, maximise and full-screen requests, icons, size limits.
 //! XFixes reports pointer-shape changes, which go to the client as images.
 
 use std::collections::BTreeMap;
@@ -15,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use ferostream_proto::image::{self, Image, MAX_IMAGE_SIDE};
 use ferostream_proto::tile::{MAX_TILE_SIDE, Tile};
-use ferostream_proto::{MAX_WINDOW_SIDE, Message, WindowKind};
+use ferostream_proto::{MAX_WINDOW_SIDE, Message, WindowKind, WindowState};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::{self, ConnectionExt as _};
@@ -27,6 +29,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::keyboard::Keyboard;
+use crate::wm;
 
 /// Frames a window may have unacknowledged before the agent waits for the
 /// client (keeps a slow link from queueing stale pictures).
@@ -57,6 +60,7 @@ struct Win {
     w: u16,
     h: u16,
     popup: bool,
+    state: WindowState,
     damage: damage::Damage,
     dirty: Vec<Rect>,
     sent: u32,
@@ -103,6 +107,7 @@ struct Atoms {
     wm_protocols: xproto::Atom,
     wm_delete_window: xproto::Atom,
     wake: xproto::Atom,
+    wm_normal_hints: xproto::Atom,
 }
 
 /// The display, shared by the X event thread and the input thread.
@@ -111,6 +116,9 @@ pub struct Session {
     root: xproto::Window,
     wake_window: xproto::Window,
     atoms: Atoms,
+    wm: wm::Atoms,
+    /// The client screen's DPI: icons are picked for its size.
+    dpi: u16,
     state: Mutex<State>,
     keyboard: Mutex<Keyboard>,
     out: Mutex<Box<dyn Sink>>,
@@ -137,6 +145,7 @@ impl Session {
     pub fn new(
         conn: RustConnection,
         screen: usize,
+        dpi: u16,
         out: Box<dyn Sink>,
     ) -> Result<Arc<Session>, String> {
         let root = conn
@@ -190,7 +199,13 @@ impl Session {
             wm_protocols: intern(b"WM_PROTOCOLS")?,
             wm_delete_window: intern(b"WM_DELETE_WINDOW")?,
             wake: intern(b"_FEROSTREAM_WAKE")?,
+            wm_normal_hints: xproto::AtomEnum::WM_NORMAL_HINTS.into(),
         };
+        let mut list = [0u32; wm::ATOM_NAMES.len()];
+        for (slot, name) in list.iter_mut().zip(wm::ATOM_NAMES) {
+            *slot = intern(name)?;
+        }
+        let wm = wm::Atoms::from_list(&list);
         conn.change_window_attributes(
             root,
             &xproto::ChangeWindowAttributesAux::new()
@@ -218,6 +233,35 @@ impl Session {
             &xproto::CreateWindowAux::new().override_redirect(1),
         )
         .map_err(err)?;
+        // Programs look for a window manager before they ask one to
+        // maximise a window or go full screen (EWMH): the wake window
+        // stands in as the "supporting WM check" window.
+        conn.change_property32(
+            xproto::PropMode::REPLACE,
+            root,
+            wm.net_supported,
+            xproto::AtomEnum::ATOM,
+            &wm.supported(),
+        )
+        .map_err(err)?;
+        for w in [root, wake_window] {
+            conn.change_property32(
+                xproto::PropMode::REPLACE,
+                w,
+                wm.net_supporting_wm_check,
+                xproto::AtomEnum::WINDOW,
+                &[wake_window],
+            )
+            .map_err(err)?;
+        }
+        conn.change_property8(
+            xproto::PropMode::REPLACE,
+            wake_window,
+            atoms.net_wm_name,
+            atoms.utf8_string,
+            b"FeroStream",
+        )
+        .map_err(err)?;
         let keyboard = Keyboard::load(&conn)?;
         conn.sync().map_err(err)?;
         Ok(Arc::new(Session {
@@ -225,6 +269,8 @@ impl Session {
             root,
             wake_window,
             atoms,
+            wm,
+            dpi,
             state: Mutex::new(State::default()),
             keyboard: Mutex::new(keyboard),
             out: Mutex::new(out),
@@ -342,17 +388,22 @@ impl Session {
             Event::XfixesCursorNotify(e) if lock(&self.state).cursor != Some(e.cursor_serial) => {
                 self.send_cursor()?;
             }
-            Event::PropertyNotify(e)
-                if (e.atom == self.atoms.net_wm_name
-                    || e.atom == u32::from(xproto::AtomEnum::WM_NAME))
-                    && lock(&self.state).windows.contains_key(&e.window) =>
-            {
-                let title = self.title(e.window);
-                self.send(&[Message::WindowTitle {
-                    window: e.window,
-                    title,
-                }])?;
+            Event::PropertyNotify(e) if lock(&self.state).windows.contains_key(&e.window) => {
+                if e.atom == self.atoms.net_wm_name
+                    || e.atom == u32::from(xproto::AtomEnum::WM_NAME)
+                {
+                    let title = self.title(e.window);
+                    self.send(&[Message::WindowTitle {
+                        window: e.window,
+                        title,
+                    }])?;
+                } else if e.atom == self.wm.net_wm_icon {
+                    self.send(&self.icons(e.window))?;
+                } else if e.atom == self.atoms.wm_normal_hints {
+                    self.send(&[self.hints(e.window)])?;
+                }
             }
+            Event::ClientMessage(e) if e.format == 32 => self.client_message(&e)?,
             _ => {}
         }
         Ok(())
@@ -382,25 +433,32 @@ impl Session {
             .map_err(err)?;
         let title = self.title(window);
         let transient_for = self.transient_for(window);
+        let kind = if override_redirect {
+            WindowKind::Popup
+        } else {
+            let types = self.atom_list(window, self.wm.net_wm_window_type);
+            self.wm.kind(&types, transient_for != 0)
+        };
+        let state = if kind == WindowKind::Popup {
+            WindowState::Normal
+        } else {
+            self.initial_state(window)
+        };
         let (w, h) = (clamp_side(geo.width), clamp_side(geo.height));
         let win = Win {
             x: geo.x,
             y: geo.y,
             w,
             h,
-            popup: override_redirect,
+            popup: kind == WindowKind::Popup,
+            state,
             damage,
             dirty: vec![Rect { x: 0, y: 0, w, h }],
             sent: 0,
             acked: 0,
         };
-        let kind = if win.popup {
-            WindowKind::Popup
-        } else {
-            WindowKind::Normal
-        };
         lock(&self.state).windows.insert(window, win);
-        self.send(&[Message::WindowNew {
+        let mut frames = vec![Message::WindowNew {
             window,
             x: i32::from(geo.x),
             y: i32::from(geo.y),
@@ -409,7 +467,146 @@ impl Session {
             kind,
             transient_for,
             title,
-        }])
+        }];
+        if kind != WindowKind::Popup {
+            self.write_state(window, state);
+            frames.push(self.hints(window));
+            frames.extend(self.icons(window));
+            if state != WindowState::Normal {
+                frames.push(Message::WindowState { window, state });
+            }
+        }
+        self.send(&frames)
+    }
+
+    /// A list of atoms in a window property (a window type, a state).
+    fn atom_list(&self, window: xproto::Window, prop: xproto::Atom) -> Vec<u32> {
+        self.conn
+            .get_property(false, window, prop, xproto::AtomEnum::ATOM, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(Iterator::collect))
+            .unwrap_or_default()
+    }
+
+    /// The state a program asked for before showing its window.
+    fn initial_state(&self, window: xproto::Window) -> WindowState {
+        let set = self.atom_list(window, self.wm.net_wm_state);
+        if set.contains(&self.wm.net_wm_state_fullscreen) {
+            WindowState::Fullscreen
+        } else if set.contains(&self.wm.net_wm_state_maximized_vert)
+            && set.contains(&self.wm.net_wm_state_maximized_horz)
+        {
+            WindowState::Maximized
+        } else {
+            WindowState::Normal
+        }
+    }
+
+    /// Records a window's state where programs read it: `_NET_WM_STATE`
+    /// and ICCCM `WM_STATE` (normal 1, iconic 3).
+    fn write_state(&self, window: xproto::Window, state: WindowState) {
+        let _ = self.conn.change_property32(
+            xproto::PropMode::REPLACE,
+            window,
+            self.wm.net_wm_state,
+            xproto::AtomEnum::ATOM,
+            &self.wm.state_atoms(state),
+        );
+        let iccm = if state == WindowState::Minimized {
+            3
+        } else {
+            1
+        };
+        let _ = self.conn.change_property32(
+            xproto::PropMode::REPLACE,
+            window,
+            self.wm.wm_state,
+            self.wm.wm_state,
+            &[iccm, x11rb::NONE],
+        );
+    }
+
+    /// The window's size limits.
+    fn hints(&self, window: xproto::Window) -> Message {
+        let raw: Vec<u32> = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.wm_normal_hints,
+                xproto::AtomEnum::WM_SIZE_HINTS,
+                0,
+                18,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(Iterator::collect))
+            .unwrap_or_default();
+        let (min_width, min_height, max_width, max_height) = wm::size_limits(&raw);
+        Message::WindowHints {
+            window,
+            min_width,
+            min_height,
+            max_width,
+            max_height,
+        }
+    }
+
+    /// The window's icons for the taskbar and the title bar, sized for the
+    /// client screen.
+    fn icons(&self, window: xproto::Window) -> Vec<Message> {
+        // At most 4 MiB of icons (a few 256 x 256 ones).
+        let value: Vec<u32> = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.wm.net_wm_icon,
+                xproto::AtomEnum::CARDINAL,
+                0,
+                1 << 20,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(Iterator::collect))
+            .unwrap_or_default();
+        let scale = |side: u32| (side * u32::from(self.dpi) / 96).min(256) as u16;
+        let mut out = Vec::new();
+        for (big, side) in [(true, scale(32)), (false, scale(16))] {
+            if let Some(image) = wm::pick_icon(&value, side) {
+                out.push(Message::WindowIcon { window, big, image });
+            }
+        }
+        out
+    }
+
+    /// Requests programs send to the window manager (to the root window).
+    fn client_message(&self, e: &xproto::ClientMessageEvent) -> Result<(), String> {
+        let d = e.data.as_data32();
+        let window = e.window;
+        let current = match lock(&self.state).windows.get(&window) {
+            Some(w) if !w.popup => w.state,
+            _ => return Ok(()),
+        };
+        let new = if e.type_ == self.wm.net_wm_state {
+            self.wm.apply_state_request(current, d[0], d[1], d[2])
+        } else if e.type_ == self.wm.wm_change_state && d[0] == 3 {
+            WindowState::Minimized
+        } else if e.type_ == self.wm.net_close_window {
+            self.close(window);
+            return Ok(());
+        } else {
+            return Ok(());
+        };
+        if new == current {
+            return Ok(());
+        }
+        if let Some(w) = lock(&self.state).windows.get_mut(&window) {
+            w.state = new;
+        }
+        self.write_state(window, new);
+        self.send(&[Message::WindowState { window, state: new }])
     }
 
     /// Sends the pointer shape the display shows now.
@@ -586,6 +783,16 @@ impl Session {
                     .windows
                     .get(&window)
                     .is_some_and(|w| !w.popup);
+                let active = if normal { window } else { x11rb::NONE };
+                if normal || window == 0 {
+                    let _ = self.conn.change_property32(
+                        xproto::PropMode::REPLACE,
+                        self.root,
+                        self.wm.net_active_window,
+                        xproto::AtomEnum::WINDOW,
+                        &[active],
+                    );
+                }
                 if normal {
                     let _ = self.conn.set_input_focus(
                         xproto::InputFocus::PARENT,
@@ -619,6 +826,18 @@ impl Session {
                 }
             }
             Message::WindowClose { window } => self.close(window),
+            Message::WindowState { window, state } => {
+                let known = match lock(&self.state).windows.get_mut(&window) {
+                    Some(w) if !w.popup && w.state != state => {
+                        w.state = state;
+                        true
+                    }
+                    _ => false,
+                };
+                if known {
+                    self.write_state(window, state);
+                }
+            }
             Message::Ping { token } => self.send(&[Message::Pong { token }])?,
             _ => {}
         }

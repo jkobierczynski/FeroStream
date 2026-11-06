@@ -10,6 +10,8 @@ mod scale;
 #[cfg(unix)]
 mod session;
 #[cfg(unix)]
+mod wm;
+#[cfg(unix)]
 mod xserver;
 
 #[cfg(unix)]

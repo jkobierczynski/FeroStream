@@ -21,12 +21,13 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use ferostream_proto::{Message, VERSION, WindowKind};
+use ferostream_proto::{Message, VERSION, WindowKind, WindowState};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, ClientToScreen, CreateSolidBrush,
-    DIB_RGB_COLORS, EndPaint, FillRect, HBRUSH, InvalidateRect, PAINTSTRUCT, SRCCOPY,
-    ScreenToClient, StretchDIBits,
+    DIB_RGB_COLORS, EndPaint, FillRect, GetMonitorInfoW, HBRUSH, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SRCCOPY, ScreenToClient,
+    StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -69,6 +70,14 @@ struct Remote {
     /// Tiles of the frame still arriving: drawn together at FrameEnd, so a
     /// half-received frame is never on screen.
     pending: Vec<ferostream_proto::tile::Tile>,
+    /// Smallest and biggest client size the program allows; 0 is no limit.
+    min: (u16, u16),
+    max: (u16, u16),
+    state: WindowState,
+    /// Big (taskbar) and small (title bar) icons the window shows.
+    icons: [Option<HICON>; 2],
+    /// While full screen: the style and frame to go back to.
+    restore: Option<(i32, RECT)>,
 }
 
 impl Remote {
@@ -382,6 +391,9 @@ impl App {
                     self.by_hwnd.remove(&(r.hwnd.0 as isize));
                     unsafe {
                         let _ = DestroyWindow(r.hwnd);
+                        for icon in r.icons.into_iter().flatten() {
+                            let _ = DestroyIcon(icon);
+                        }
                     }
                 }
             }
@@ -401,6 +413,41 @@ impl App {
                 hot_y,
                 image,
             } => self.set_cursor(crate::picture::cursor(hot_x, hot_y, &image)),
+            Message::WindowHints {
+                window,
+                min_width,
+                min_height,
+                max_width,
+                max_height,
+            } => {
+                if let Some(r) = self.windows.get_mut(&window) {
+                    r.min = (min_width, min_height);
+                    r.max = (max_width, max_height);
+                }
+            }
+            Message::WindowIcon { window, big, image } => {
+                if let Some(r) = self.windows.get_mut(&window)
+                    && let Some(icon) = crate::picture::icon(&image)
+                {
+                    let which = if big { ICON_BIG } else { ICON_SMALL };
+                    unsafe {
+                        SendMessageW(
+                            r.hwnd,
+                            WM_SETICON,
+                            Some(WPARAM(which as usize)),
+                            Some(LPARAM(icon.0 as isize)),
+                        );
+                    }
+                    let [big_slot, small_slot] = &mut r.icons;
+                    let slot = if big { big_slot } else { small_slot };
+                    if let Some(old) = slot.replace(icon) {
+                        unsafe {
+                            let _ = DestroyIcon(old);
+                        }
+                    }
+                }
+            }
+            Message::WindowState { window, state } => self.set_state(window, state),
             Message::Ping { token } => self.link.send(Message::Pong { token }),
             Message::Exited { code } => {
                 self.ended = true;
@@ -437,6 +484,7 @@ impl App {
         let owner = self
             .windows
             .get(&transient_for)
+            .filter(|_| kind != WindowKind::Normal)
             .map(|r| r.hwnd)
             .or_else(|| {
                 // A popup belongs to the window that has the focus.
@@ -446,7 +494,8 @@ impl App {
             });
         // Ordinary windows the program put at the very corner (no window
         // manager placed them) go where Windows puts new windows.
-        let at_default = kind == WindowKind::Normal && x == 0 && y == 0;
+        let at_default =
+            matches!(kind, WindowKind::Normal | WindowKind::Dialog) && x == 0 && y == 0;
         let instance = unsafe { GetModuleHandleW(None) }.ok().map(Into::into);
         let hwnd = unsafe {
             CreateWindowExW(
@@ -481,6 +530,11 @@ impl App {
                 kind,
                 pointer: (0, 0),
                 pending: Vec::new(),
+                min: (0, 0),
+                max: (0, 0),
+                state: WindowState::Normal,
+                icons: [None, None],
+                restore: None,
             },
         );
         self.by_hwnd.insert(hwnd.0 as isize, window);
@@ -501,7 +555,7 @@ impl App {
                 },
             );
         }
-        if kind == WindowKind::Normal {
+        if kind != WindowKind::Popup {
             // Tell the agent where the window really is, and that it has
             // the focus (WM_ACTIVATE came while the state was borrowed).
             let (sx, sy) = client_origin(hwnd);
@@ -537,6 +591,98 @@ impl App {
         }
     }
 
+    /// Minimises, maximises, restores or makes full screen a window the
+    /// program asked for, then tells the agent the size that gave.
+    fn set_state(&mut self, window: u32, state: WindowState) {
+        let Some(r) = self.windows.get_mut(&window) else {
+            return;
+        };
+        if r.kind == WindowKind::Popup || r.state == state {
+            return;
+        }
+        let hwnd = r.hwnd;
+        r.state = state;
+        unsafe {
+            if state != WindowState::Fullscreen
+                && let Some((style, frame)) = r.restore.take()
+            {
+                SetWindowLongW(hwnd, GWL_STYLE, style);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    frame.left,
+                    frame.top,
+                    frame.right - frame.left,
+                    frame.bottom - frame.top,
+                    SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            match state {
+                WindowState::Normal => {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+                WindowState::Minimized => {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                }
+                WindowState::Maximized => {
+                    let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                }
+                WindowState::Fullscreen => {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let mut frame = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut frame);
+                    r.restore = Some((GetWindowLongW(hwnd, GWL_STYLE), frame));
+                    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut info = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if GetMonitorInfoW(monitor, &mut info).as_bool() {
+                        let m = info.rcMonitor;
+                        SetWindowLongW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as i32);
+                        let _ = SetWindowPos(
+                            hwnd,
+                            Some(HWND_TOP),
+                            m.left,
+                            m.top,
+                            m.right - m.left,
+                            m.bottom - m.top,
+                            SWP_FRAMECHANGED,
+                        );
+                    }
+                }
+            }
+        }
+        // The moves above came back while the state was borrowed, so the
+        // agent has not heard about them.
+        if state != WindowState::Minimized {
+            self.report_geometry(window);
+        }
+    }
+
+    /// Sends a window's client-area position and size to the agent.
+    fn report_geometry(&self, window: u32) {
+        let Some(r) = self.windows.get(&window) else {
+            return;
+        };
+        let mut client = RECT::default();
+        unsafe {
+            let _ = GetClientRect(r.hwnd, &mut client);
+        }
+        if client.right <= 0 || client.bottom <= 0 {
+            return;
+        }
+        let (x, y) = client_origin(r.hwnd);
+        let side = |v: i32| v.clamp(1, i32::from(ferostream_proto::MAX_WINDOW_SIDE)) as u16;
+        self.link.send(Message::WindowMove {
+            window,
+            x: x - self.origin.0,
+            y: y - self.origin.1,
+            width: side(client.right),
+            height: side(client.bottom),
+        });
+    }
+
     fn release_held(&mut self) {
         for keysym in self.held.drain(..) {
             self.link.send(Message::Key {
@@ -569,6 +715,9 @@ impl App {
 fn styles(kind: WindowKind) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
     match kind {
         WindowKind::Normal => (WS_OVERLAPPEDWINDOW, WINDOW_EX_STYLE(0)),
+        WindowKind::Dialog => (WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, WS_EX_DLGMODALFRAME),
+        WindowKind::Utility => (WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, WS_EX_TOOLWINDOW),
+        WindowKind::Splash => (WS_POPUP, WINDOW_EX_STYLE(0)),
         WindowKind::Popup => (
             WS_POPUP,
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
@@ -888,6 +1037,68 @@ fn on_window(
             }
             None
         }
+        WM_GETMINMAXINFO => {
+            let r = app.windows.get(&id)?;
+            if r.kind == WindowKind::Popup || (r.min == (0, 0) && r.max == (0, 0)) {
+                return None;
+            }
+            // The limits are for the client area; Windows wants the frame.
+            let frame = |w: u16, h: u16| {
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: i32::from(w),
+                    bottom: i32::from(h),
+                };
+                unsafe {
+                    let style = WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32);
+                    let ex = WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32);
+                    let _ = AdjustWindowRectExForDpi(
+                        &mut rect,
+                        style,
+                        false,
+                        ex,
+                        GetDpiForWindow(hwnd),
+                    );
+                }
+                (rect.right - rect.left, rect.bottom - rect.top)
+            };
+            // SAFETY: Windows passes a MINMAXINFO for this message.
+            let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            let (minw, minh) = frame(r.min.0.max(1), r.min.1.max(1));
+            if r.min.0 > 0 {
+                info.ptMinTrackSize.x = minw;
+            }
+            if r.min.1 > 0 {
+                info.ptMinTrackSize.y = minh;
+            }
+            let (maxw, maxh) = frame(r.max.0.max(1), r.max.1.max(1));
+            if r.max.0 > 0 {
+                info.ptMaxTrackSize.x = maxw;
+            }
+            if r.max.1 > 0 {
+                info.ptMaxTrackSize.y = maxh;
+            }
+            Some(LRESULT(0))
+        }
+        WM_SIZE => {
+            let r = app.windows.get_mut(&id)?;
+            if r.kind == WindowKind::Popup {
+                return None;
+            }
+            let state = match wparam.0 as u32 {
+                SIZE_MINIMIZED => WindowState::Minimized,
+                SIZE_MAXIMIZED => WindowState::Maximized,
+                SIZE_RESTORED if r.restore.is_some() => WindowState::Fullscreen,
+                SIZE_RESTORED => WindowState::Normal,
+                _ => return None,
+            };
+            if state != r.state {
+                r.state = state;
+                app.link.send(Message::WindowState { window: id, state });
+            }
+            None
+        }
         WM_CLOSE => {
             // The program decides; the window goes when the agent says so.
             app.link.send(Message::WindowClose { window: id });
@@ -895,7 +1106,7 @@ fn on_window(
         }
         WM_WINDOWPOSCHANGED => {
             let r = app.windows.get(&id)?;
-            if r.kind == WindowKind::Normal {
+            if r.kind != WindowKind::Popup {
                 let mut client = RECT::default();
                 unsafe {
                     let _ = GetClientRect(hwnd, &mut client);

@@ -31,7 +31,7 @@ pub mod tile;
 
 /// Protocol version this crate speaks. Both sides send theirs in
 /// [`Message::Hello`]; a side refuses a version it does not know.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// What the agent writes before its first frame.
 pub const PREAMBLE: &[u8] = b"\0FEROSTREAM\n";
@@ -63,6 +63,66 @@ pub enum WindowKind {
     /// A menu, tooltip or drop-down (X11 override-redirect): no frame, no
     /// taskbar button, never takes the focus.
     Popup,
+    /// A dialog: a frame without minimise and maximise buttons, kept above
+    /// the window it belongs to.
+    Dialog,
+    /// A tool palette or toolbar: a small frame, no taskbar button.
+    Utility,
+    /// A splash screen: no frame.
+    Splash,
+}
+
+impl WindowKind {
+    fn to_u8(self) -> u8 {
+        match self {
+            WindowKind::Normal => 0,
+            WindowKind::Popup => 1,
+            WindowKind::Dialog => 2,
+            WindowKind::Utility => 3,
+            WindowKind::Splash => 4,
+        }
+    }
+
+    fn from_u8(v: u8) -> Result<Self, Error> {
+        Ok(match v {
+            0 => WindowKind::Normal,
+            1 => WindowKind::Popup,
+            2 => WindowKind::Dialog,
+            3 => WindowKind::Utility,
+            4 => WindowKind::Splash,
+            _ => return Err(Error::Invalid("window kind")),
+        })
+    }
+}
+
+/// Whether a window is minimised, maximised or full screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowState {
+    Normal,
+    Minimized,
+    Maximized,
+    Fullscreen,
+}
+
+impl WindowState {
+    fn to_u8(self) -> u8 {
+        match self {
+            WindowState::Normal => 0,
+            WindowState::Minimized => 1,
+            WindowState::Maximized => 2,
+            WindowState::Fullscreen => 3,
+        }
+    }
+
+    fn from_u8(v: u8) -> Result<Self, Error> {
+        Ok(match v {
+            0 => WindowState::Normal,
+            1 => WindowState::Minimized,
+            2 => WindowState::Maximized,
+            3 => WindowState::Fullscreen,
+            _ => return Err(Error::Invalid("window state")),
+        })
+    }
 }
 
 /// One message, either way.
@@ -75,6 +135,9 @@ pub enum Message {
     Ping { token: u32 },
     /// Answers a [`Message::Ping`].
     Pong { token: u32 },
+    /// A window was minimised, maximised, made full screen or restored: by
+    /// the user (client to agent) or by the program (agent to client).
+    WindowState { window: u32, state: WindowState },
 
     // ----- Client to agent -----
     /// Starts a program. `width` x `height` is the size of the virtual
@@ -144,6 +207,22 @@ pub enum Message {
     },
     /// A window's title changed.
     WindowTitle { window: u32, title: String },
+    /// The sizes a window may take (from the program's size hints); 0 is
+    /// no limit. Equal minimum and maximum: the window cannot be resized.
+    WindowHints {
+        window: u32,
+        min_width: u16,
+        min_height: u16,
+        max_width: u16,
+        max_height: u16,
+    },
+    /// A window's icon, for its title bar and taskbar button: `big` for the
+    /// taskbar and Alt+Tab, else the small one in the title bar.
+    WindowIcon {
+        window: u32,
+        big: bool,
+        image: image::Image,
+    },
     /// A window went away (closed or hidden).
     WindowGone { window: u32 },
     /// The pointer shape changed: show `image` over every window from now
@@ -170,6 +249,7 @@ impl Message {
             Message::Hello { .. } => 1,
             Message::Ping { .. } => 2,
             Message::Pong { .. } => 3,
+            Message::WindowState { .. } => 4,
             Message::Start { .. } => 16,
             Message::PointerMove { .. } => 17,
             Message::PointerButton { .. } => 18,
@@ -188,6 +268,8 @@ impl Message {
             Message::Exited { .. } => 70,
             Message::Error { .. } => 71,
             Message::Cursor { .. } => 72,
+            Message::WindowHints { .. } => 73,
+            Message::WindowIcon { .. } => 74,
         }
     }
 
@@ -202,6 +284,10 @@ impl Message {
                 w.str(software);
             }
             Message::Ping { token } | Message::Pong { token } => w.u32(*token),
+            Message::WindowState { window, state } => {
+                w.u32(*window);
+                w.u8(state.to_u8());
+            }
             Message::Start {
                 width,
                 height,
@@ -281,10 +367,7 @@ impl Message {
                 w.i32(*y);
                 w.u16(*width);
                 w.u16(*height);
-                w.u8(match kind {
-                    WindowKind::Normal => 0,
-                    WindowKind::Popup => 1,
-                });
+                w.u8(kind.to_u8());
                 w.u32(*transient_for);
                 w.str(title);
             }
@@ -312,6 +395,24 @@ impl Message {
                 w.u16(*hot_y);
                 w.image(image);
             }
+            Message::WindowHints {
+                window,
+                min_width,
+                min_height,
+                max_width,
+                max_height,
+            } => {
+                w.u32(*window);
+                w.u16(*min_width);
+                w.u16(*min_height);
+                w.u16(*max_width);
+                w.u16(*max_height);
+            }
+            Message::WindowIcon { window, big, image } => {
+                w.u32(*window);
+                w.u8(u8::from(*big));
+                w.image(image);
+            }
         }
         let mut out = w.0;
         let len = (out.len() - 4) as u32;
@@ -336,6 +437,10 @@ impl Message {
             },
             2 => Message::Ping { token: r.u32()? },
             3 => Message::Pong { token: r.u32()? },
+            4 => Message::WindowState {
+                window: r.u32()?,
+                state: WindowState::from_u8(r.u8()?)?,
+            },
             16 => {
                 let width = r.side()?;
                 let height = r.side()?;
@@ -396,11 +501,7 @@ impl Message {
                 y: r.i32()?,
                 width: r.side()?,
                 height: r.side()?,
-                kind: match r.u8()? {
-                    0 => WindowKind::Normal,
-                    1 => WindowKind::Popup,
-                    _ => return Err(Error::Invalid("window kind")),
-                },
+                kind: WindowKind::from_u8(r.u8()?)?,
                 transient_for: r.u32()?,
                 title: r.str()?,
             },
@@ -455,6 +556,28 @@ impl Message {
                     image,
                 }
             }
+            73 => {
+                let window = r.u32()?;
+                let mut limit = || -> Result<u16, Error> {
+                    let v = r.u16()?;
+                    if v > MAX_WINDOW_SIDE {
+                        return Err(Error::Invalid("size hint"));
+                    }
+                    Ok(v)
+                };
+                Message::WindowHints {
+                    window,
+                    min_width: limit()?,
+                    min_height: limit()?,
+                    max_width: limit()?,
+                    max_height: limit()?,
+                }
+            }
+            74 => Message::WindowIcon {
+                window: r.u32()?,
+                big: r.bool()?,
+                image: r.image()?,
+            },
             _ => return Err(Error::UnknownTag(tag)),
         };
         if !r.0.is_empty() {
@@ -749,6 +872,22 @@ mod tests {
                 hot_x: 3,
                 hot_y: 4,
                 image: image::Image::new(16, 16, &[1; 16 * 16 * 4]),
+            },
+            Message::WindowState {
+                window: 3,
+                state: WindowState::Maximized,
+            },
+            Message::WindowHints {
+                window: 3,
+                min_width: 200,
+                min_height: 100,
+                max_width: 0,
+                max_height: 0,
+            },
+            Message::WindowIcon {
+                window: 3,
+                big: true,
+                image: image::Image::new(32, 32, &[2; 32 * 32 * 4]),
             },
             Message::Exited { code: -1 },
             Message::Error {

@@ -31,7 +31,7 @@ fn drain(reader: &mut FrameReader) {
                 assert_eq!(px.len(), t.pixel_bytes());
             }
         }
-        if let Message::Cursor { image, .. } = &m {
+        if let Message::Cursor { image, .. } | Message::WindowIcon { image, .. } = &m {
             if let Ok(px) = image.decode() {
                 assert_eq!(px.len(), image.pixel_bytes());
             }

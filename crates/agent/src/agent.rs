@@ -140,7 +140,7 @@ fn run() -> Result<i32, String> {
     let auth = xs.auth_file.clone();
     lock(&running).xserver = Some(xs);
 
-    let session = match Session::new(conn, screen, Box::new(out)) {
+    let session = match Session::new(conn, screen, dpi, Box::new(out)) {
         Ok(s) => s,
         Err(e) => {
             lock(&running).stop();

@@ -1,4 +1,4 @@
-//! Pointer shapes (and, later, window icons) from the agent's images.
+//! Pointer shapes and window icons from the agent's images.
 //!
 //! Windows builds both from a 32-bit colour bitmap with alpha plus a
 //! monochrome mask; with an alpha bitmap the mask is ignored, so it is left
@@ -17,6 +17,11 @@ use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HCURSOR, HICON
 pub fn cursor(hot_x: u16, hot_y: u16, image: &Image) -> Option<HCURSOR> {
     let hicon = build(image, false, u32::from(hot_x), u32::from(hot_y))?;
     Some(HCURSOR(hicon.0))
+}
+
+/// A Windows icon (title bar, taskbar) from the agent's image.
+pub fn icon(image: &Image) -> Option<HICON> {
+    build(image, true, 0, 0)
 }
 
 fn build(image: &Image, is_icon: bool, hot_x: u32, hot_y: u32) -> Option<HICON> {

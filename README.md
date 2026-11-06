@@ -26,12 +26,14 @@ will.
 
 ## Status
 
-Step 1 of the [plan](https://claude.ai/artifact/256vVGrd767CWXCAcpPEd1) and
-part of step 2: windows appear, pixels stream (LZ4 tiles), mouse and keyboard
-work, titles follow, text is sized for your screen's scaling, the pointer
-takes the program's shapes, and closing the window or exiting the program
-ends the session. Not yet: clipboard, taskbar icons, smarter compression,
-QUIC, reattaching to a running session.
+Steps 1 and 2 of the [plan](https://claude.ai/artifact/256vVGrd767CWXCAcpPEd1):
+windows appear, pixels stream (LZ4 tiles), mouse and keyboard work, titles
+and icons show on the taskbar, text is sized for your screen's scaling, the
+pointer takes the program's shapes, dialogs stay above their window, menus
+and tooltips have no frame, size limits hold, and minimise, maximise and
+full screen work from either side. Closing the window or exiting the program
+ends the session. Not yet: clipboard, multiple monitors, smarter
+compression, QUIC, reattaching to a running session.
 
 Typing goes through your Windows keyboard layout: the client sends the
 characters Windows produces (dead keys and AltGr included), so the host
