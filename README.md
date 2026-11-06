@@ -48,6 +48,9 @@ On Windows:
 ferostream.exe [-p PORT] [-i KEY] [-J JUMP] [user@]host [program [args...]]
 ```
 
+KDE and Qt programs show their icons when the host has an icon theme
+(`sudo apt install breeze-icon-theme`); the agent tells them to use it.
+
 The program defaults to `xterm`. Passwords and host-key questions appear in a
 small dialog. `ferostream.exe --help` lists every option.
 

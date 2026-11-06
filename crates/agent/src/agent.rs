@@ -169,6 +169,9 @@ fn run() -> Result<i32, String> {
         .env("QT_QPA_PLATFORM", "xcb")
         .env_remove("WAYLAND_DISPLAY")
         .envs(scale::environment(dpi))
+        .envs(desktop_environment(
+            std::env::var_os("XDG_CURRENT_DESKTOP").is_some(),
+        ))
         .stdin(Stdio::null())
         .stdout(to_stderr())
         .stderr(to_stderr())
@@ -258,4 +261,33 @@ fn fail(out: &mut impl Write, message: &str) -> Result<i32, String> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// What a program expects from a desktop session that the private display
+/// does not have. Without `XDG_CURRENT_DESKTOP`, Qt picks a bare theme with
+/// almost no icons (KStars showed blank buttons); `KDE` selects Qt's KDE
+/// theme, which reads `kdeglobals` and uses the Breeze icons when they are
+/// installed. GTK programs are not affected by it. A value the host already
+/// sets is kept.
+fn desktop_environment(already_set: bool) -> Vec<(&'static str, &'static str)> {
+    let mut env = vec![("XDG_SESSION_TYPE", "x11")];
+    if !already_set {
+        env.push(("XDG_CURRENT_DESKTOP", "KDE"));
+    }
+    env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::desktop_environment;
+
+    #[test]
+    fn desktop_is_kde_unless_the_host_says_otherwise() {
+        assert!(desktop_environment(false).contains(&("XDG_CURRENT_DESKTOP", "KDE")));
+        assert!(
+            desktop_environment(true)
+                .iter()
+                .all(|(k, _)| *k != "XDG_CURRENT_DESKTOP")
+        );
+    }
 }
