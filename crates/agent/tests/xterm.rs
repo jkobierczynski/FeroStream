@@ -3,6 +3,7 @@
 //! Skipped when Xvfb or xterm is missing, unless FEROSTREAM_REQUIRE_X is set
 //! (CI sets it).
 
+#![cfg(unix)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
