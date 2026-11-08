@@ -12,9 +12,11 @@
 )]
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use ferostream_proto::{FrameReader, Message, Monitor, VERSION, WindowKind, WindowState};
 
@@ -30,9 +32,56 @@ fn have(program: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// A runtime directory of the test's own, so its sessions are its own;
+/// sessions still running when it is dropped are stopped.
+struct Runtime(PathBuf);
+
+impl Runtime {
+    fn new() -> Arc<Runtime> {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ferostream-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(Runtime(dir))
+    }
+
+    fn agent(&self) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_ferostream-agent"));
+        c.env("FEROSTREAM_RUNTIME_DIR", &self.0);
+        c
+    }
+
+    fn sessions(&self) -> Vec<String> {
+        std::fs::read_dir(&self.0)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn session_dir(&self, id: &str) -> PathBuf {
+        self.0.join(id)
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        for id in self.sessions() {
+            let _ = self.agent().args(["--stop", &id]).status();
+        }
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 struct Agent {
     child: std::process::Child,
     rx: mpsc::Receiver<Message>,
+    runtime: Arc<Runtime>,
 }
 
 impl Agent {
@@ -41,8 +90,45 @@ impl Agent {
     }
 
     fn start_at(argv: &[&str], dpi: u16) -> Agent {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ferostream-agent"))
+        let mut a = Self::connect(Runtime::new(), &[]);
+        a.send(Message::Hello {
+            version: VERSION,
+            software: "test".into(),
+        });
+        a.send(Message::Start {
+            width: 1024,
+            height: 768,
+            dpi,
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+        });
+        a
+    }
+
+    /// Attaches to a session in `runtime`: `id`, or the newest detached.
+    fn attach(runtime: &Arc<Runtime>, id: Option<&str>) -> Agent {
+        let mut extra = vec!["--attach"];
+        extra.extend(id);
+        let mut a = Self::connect(Arc::clone(runtime), &extra);
+        // A relay that found nothing to attach to has already answered and
+        // gone: these may not get through.
+        let stdin = a.child.stdin.as_mut().unwrap();
+        for m in [
+            Message::Hello {
+                version: VERSION,
+                software: "test".into(),
+            },
+            Message::Attach,
+        ] {
+            let _ = stdin.write_all(&m.encode()).and_then(|()| stdin.flush());
+        }
+        a
+    }
+
+    fn connect(runtime: Arc<Runtime>, extra: &[&str]) -> Agent {
+        let mut child = runtime
+            .agent()
             .arg("--stdio")
+            .args(extra)
             .env(HELPER, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -66,18 +152,16 @@ impl Agent {
                 }
             }
         });
-        let mut a = Agent { child, rx };
-        a.send(Message::Hello {
-            version: VERSION,
-            software: "test".into(),
-        });
-        a.send(Message::Start {
-            width: 1024,
-            height: 768,
-            dpi,
-            argv: argv.iter().map(|s| s.to_string()).collect(),
-        });
-        a
+        Agent { child, rx, runtime }
+    }
+
+    /// Messages until `f` picks one out.
+    fn until<T>(&self, mut f: impl FnMut(Message) -> Option<T>) -> T {
+        loop {
+            if let Some(t) = f(self.next()) {
+                return t;
+            }
+        }
     }
 
     fn send(&mut self, m: Message) {
@@ -738,4 +822,176 @@ fn menus_close_when_focus_leaves() {
     }
     drop(a.child.stdin.take());
     let _ = a.child.wait();
+}
+
+fn need_x() -> bool {
+    if have("Xvfb") && have("xterm") {
+        return true;
+    }
+    assert!(
+        std::env::var_os("FEROSTREAM_REQUIRE_X").is_none(),
+        "Xvfb and xterm are required"
+    );
+    eprintln!("skipped: Xvfb or xterm missing");
+    false
+}
+
+fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A full picture of `window`: tiles up to its FrameEnd, acknowledged.
+fn picture(a: &mut Agent, window: u32) -> usize {
+    let mut tiles = 0;
+    let seq = a.until(|m| match m {
+        Message::Tile(t) if t.window == window => {
+            tiles += 1;
+            None
+        }
+        Message::FrameEnd { window: w, seq } if w == window => Some(seq),
+        _ => None,
+    });
+    a.send(Message::FrameAck { window, seq });
+    tiles
+}
+
+fn session_list(runtime: &Runtime) -> String {
+    let out = runtime.agent().arg("--list").output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn session_survives_a_dropped_connection() {
+    if !need_x() {
+        return;
+    }
+    let mut a = Agent::start(&["xterm", "-geometry", "40x10", "-T", "come-back"]);
+    assert!(matches!(a.next(), Message::Hello { .. }));
+    let id = match a.next() {
+        Message::Session { id, windows } => {
+            assert!(windows.is_empty(), "{windows:?}");
+            id
+        }
+        other => panic!("expected Session, got {other:?}"),
+    };
+    let window = a.until(|m| match m {
+        Message::WindowNew { window, .. } => Some(window),
+        _ => None,
+    });
+    assert!(picture(&mut a, window) > 0);
+    let runtime = Arc::clone(&a.runtime);
+    let dir = runtime.session_dir(&id);
+    assert!(dir.join("sock").exists());
+    assert!(session_list(&runtime).contains("attached"));
+
+    // The connection drops (ssh killed): the session stays, detached.
+    a.child.kill().unwrap();
+    let _ = a.child.wait();
+    wait_for("the session to notice", || dir.join("detached").exists());
+    let listed = session_list(&runtime);
+    assert!(
+        listed.contains(&id) && listed.contains("detached"),
+        "{listed}"
+    );
+    assert!(listed.contains("xterm -geometry 40x10"), "{listed}");
+
+    // Attach by id: the same window comes back, with its title and pixels.
+    let mut b = Agent::attach(&runtime, Some(&id));
+    assert!(matches!(b.next(), Message::Hello { .. }));
+    match b.next() {
+        Message::Session { id: got, windows } => {
+            assert_eq!(got, id);
+            assert_eq!(windows, vec![window]);
+        }
+        other => panic!("expected Session, got {other:?}"),
+    }
+    match b.next() {
+        Message::WindowNew {
+            window: w, title, ..
+        } => {
+            assert_eq!(w, window);
+            // The shell has set its own title by now.
+            assert!(!title.is_empty());
+        }
+        other => panic!("expected the window again, got {other:?}"),
+    }
+    assert!(picture(&mut b, window) > 0);
+    assert!(!dir.join("detached").exists());
+
+    // Typing still reaches the program after the reattach.
+    b.send(Message::Focus { window });
+    for ch in "exit\r".chars() {
+        b.send(Message::Text { ch });
+    }
+
+    // No session is detached now (b is attached), so attaching to the
+    // newest detached one finds none...
+    let none = Agent::attach(&runtime, None);
+    let message = none.until(|m| match m {
+        Message::Error { message } => Some(message),
+        _ => None,
+    });
+    assert!(message.contains("no FeroStream session"), "{message}");
+    // ...and an id that never existed is refused.
+    let wrong = Agent::attach(&runtime, Some("000000000000"));
+    let message = wrong.until(|m| match m {
+        Message::Error { message } => Some(message),
+        _ => None,
+    });
+    assert!(
+        message.contains("no FeroStream session 000000000000"),
+        "{message}"
+    );
+
+    // The shell got "exit": xterm ends, and with it the session.
+    let code = b.until(|m| match m {
+        Message::Exited { code } => Some(code),
+        _ => None,
+    });
+    assert_eq!(code, 0);
+    wait_for("the session directory to go", || !dir.exists());
+}
+
+#[test]
+fn a_new_client_takes_over_from_the_old_one() {
+    if !need_x() {
+        return;
+    }
+    let a = Agent::start(&["xterm", "-geometry", "40x10"]);
+    let id = a.until(|m| match m {
+        Message::Session { id, .. } => Some(id),
+        _ => None,
+    });
+    let window = a.until(|m| match m {
+        Message::WindowNew { window, .. } => Some(window),
+        _ => None,
+    });
+    let runtime = Arc::clone(&a.runtime);
+    // The old link is still up (a silent network drop looks like this): the
+    // new client takes over and the old one is let go.
+    let mut b = Agent::attach(&runtime, Some(&id));
+    let windows = b.until(|m| match m {
+        Message::Session { windows, .. } => Some(windows),
+        _ => None,
+    });
+    assert_eq!(windows, vec![window]);
+    let mut a = a;
+    wait_for("the old client to be let go", || {
+        a.child.try_wait().unwrap().is_some()
+    });
+    assert!(picture(&mut b, window) > 0);
+    stop_and_check(&runtime, &id);
+}
+
+/// `--stop` ends a session and its program.
+fn stop_and_check(runtime: &Runtime, id: &str) {
+    let status = runtime.agent().args(["--stop", id]).status().unwrap();
+    assert!(status.success());
+    assert!(!runtime.session_dir(id).exists());
+    assert!(!session_list(runtime).contains(id));
 }

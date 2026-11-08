@@ -34,8 +34,10 @@ and tooltips have no frame, size limits hold, and minimise, maximise and
 full screen work from either side. Copied text travels both ways, programs
 know your screen layout, and open menus close when you click into another
 Windows program. Closing the window or exiting the program ends the
-session. Not yet: screens with different scaling, smarter compression,
-QUIC, reattaching to a running session.
+session. The agent copies itself to the host when needed, and a program
+keeps running when the connection drops: its windows come back when the
+client reconnects. Not yet: screens with different scaling, smarter
+compression, QUIC.
 
 Copied text: what a program copies lands on the Windows clipboard; what you
 copy on Windows reaches the host when you switch to one of its windows
@@ -50,25 +52,50 @@ needs no matching layout. Keys without text (arrows, F-keys) and shortcuts
 
 ## Trying it
 
-On the Linux host, install Xvfb and put the agent where SSH finds it:
+On the Linux host, install Xvfb:
 
 ```
 sudo apt install xvfb                      # Fedora: xorg-x11-server-Xvfb
-mkdir -p ~/.local/bin
-cp ferostream-agent ~/.local/bin/          # from the CI artifact
 ```
 
-On Windows:
+On Windows, keep `ferostream-agent` next to `ferostream.exe` (the
+`ferostream-windows-x64` CI artifact has both) and run:
 
 ```
 ferostream.exe [-p PORT] [-i KEY] [-J JUMP] [user@]host [program [args...]]
 ```
+
+The client compares the host's `~/.local/bin/ferostream-agent` with its own
+copy (`cksum`: CRC and size) and, when it is missing or different, sends its
+copy over the same SSH connection, so there is one login. A file named
+`ferostream-agent-aarch64` (or another `uname -m`) next to the exe serves
+hosts of that kind. `--no-install` turns the copying off; `--agent PATH`
+uses an agent you installed yourself.
 
 KDE and Qt programs show their icons when the host has an icon theme
 (`sudo apt install breeze-icon-theme`); the agent tells them to use it.
 
 The program defaults to `xterm`. Passwords and host-key questions appear in a
 small dialog. `ferostream.exe --help` lists every option.
+
+## When the connection drops
+
+The program keeps running on the host. Its windows stay on screen, marked
+"(reconnecting…)", and the client tries again after 1, 2, 4, 8, 15 and then
+every 30 seconds; once it is back, the windows pick up where they were.
+Closing the windows while it waits leaves the program running and tells you
+how to come back to it:
+
+```
+ferostream.exe --attach me@host              # the session left most recently
+ferostream.exe --attach=3f9c0a12b7de me@host # that one
+```
+
+On the host, `ferostream-agent --list` shows the sessions and
+`ferostream-agent --stop ID` ends one. A session ends by itself when its
+program does. (On hosts where logind kills a user's processes at logout,
+`KillUserProcesses=yes`, nothing survives a dropped connection; tmux has the
+same limit.)
 
 ## Security
 
@@ -79,6 +106,12 @@ small dialog. `ferostream.exe --help` lists every option.
   or screen: it only ever sees the input you send to its own windows.
 - The Xvfb display is reachable only through a Unix socket and a random
   cookie in a file only you can read (`-nolisten tcp`).
+- A running session listens on a Unix socket in `/tmp/ferostream-<uid>/`,
+  a directory only you can enter (the agent refuses one that is not). A
+  new client that attaches sends the previous one away, as `tmux attach -d`
+  does.
+- The agent the client copies is checked on the host (size and CRC) before
+  it replaces the old one; a transfer that breaks off leaves the old agent.
 
 ## Building
 

@@ -31,7 +31,7 @@ pub mod tile;
 
 /// Protocol version this crate speaks. Both sides send theirs in
 /// [`Message::Hello`]; a side refuses a version it does not know.
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 /// What the agent writes before its first frame.
 pub const PREAMBLE: &[u8] = b"\0FEROSTREAM\n";
@@ -60,6 +60,18 @@ pub const MAX_CLIPBOARD: usize = 1024 * 1024;
 
 /// Most monitors in [`Message::Monitors`].
 pub const MAX_MONITORS: usize = 16;
+
+/// Most windows listed in [`Message::Session`].
+pub const MAX_WINDOWS: usize = 4096;
+
+/// Length of a session id: lowercase hexadecimal digits.
+pub const SESSION_ID_LEN: usize = 12;
+
+/// Whether `id` looks like a session id (so it is safe in a path or a
+/// command line).
+pub fn is_session_id(id: &str) -> bool {
+    id.len() == SESSION_ID_LEN && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// One screen of the client's desktop, on the virtual screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,10 +216,21 @@ pub enum Message {
     Focus { window: u32 },
     /// Where the client's screens are on the virtual screen, so programs
     /// keep menus and dialogs on one screen. Sent after
-    /// [`Message::Start`] and whenever the screens change.
+    /// [`Message::Start`] or [`Message::Attach`] and whenever the screens
+    /// change.
     Monitors { monitors: Vec<Monitor> },
+    /// Instead of [`Message::Start`]: take over a session that is already
+    /// running (its id is on the agent's command line, `--attach ID`). The
+    /// agent answers with [`Message::Session`] and then announces every
+    /// window again, as if new, with its pixels.
+    Attach,
 
     // ----- Agent to client -----
+    /// The session is ready: sent first after [`Message::Start`] or
+    /// [`Message::Attach`]. `id` names it for a later `--attach`; `windows`
+    /// are the windows it has now, which the agent announces next (a client
+    /// that kept windows from before a reconnect drops the others).
+    Session { id: String, windows: Vec<u32> },
     /// A window appeared.
     WindowNew {
         window: u32,
@@ -288,6 +311,8 @@ impl Message {
             Message::WindowMove { .. } => 23,
             Message::Focus { .. } => 24,
             Message::Monitors { .. } => 25,
+            Message::Attach => 26,
+            Message::Session { .. } => 76,
             Message::WindowNew { .. } => 64,
             Message::WindowConfigure { .. } => 65,
             Message::WindowTitle { .. } => 66,
@@ -333,6 +358,15 @@ impl Message {
                     w.u16(m.y);
                     w.u16(m.width);
                     w.u16(m.height);
+                }
+            }
+            Message::Attach => {}
+            Message::Session { id, windows } => {
+                w.str(id);
+                let n = windows.len().min(MAX_WINDOWS);
+                w.u32(n as u32);
+                for window in windows.iter().take(n) {
+                    w.u32(*window);
                 }
             }
             Message::Start {
@@ -573,6 +607,22 @@ impl Message {
                     monitors.push(m);
                 }
                 Message::Monitors { monitors }
+            }
+            26 => Message::Attach,
+            76 => {
+                let id = r.str()?;
+                if !is_session_id(&id) {
+                    return Err(Error::Invalid("session id"));
+                }
+                let n = r.u32()? as usize;
+                if n > MAX_WINDOWS {
+                    return Err(Error::Invalid("window count"));
+                }
+                let mut windows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    windows.push(r.u32()?);
+                }
+                Message::Session { id, windows }
             }
             64 => Message::WindowNew {
                 window: r.u32()?,
@@ -989,6 +1039,15 @@ mod tests {
                 ],
             },
             Message::WindowActivate { window: 3 },
+            Message::Attach,
+            Message::Session {
+                id: "0123456789ab".into(),
+                windows: vec![3, 0x20_0001],
+            },
+            Message::Session {
+                id: "abcdefabcdef".into(),
+                windows: Vec::new(),
+            },
             Message::Exited { code: -1 },
             Message::Error {
                 message: "Xvfb is not installed".into(),
@@ -1043,6 +1102,35 @@ mod tests {
         let mut r = FrameReader::new();
         r.push(&u32::MAX.to_le_bytes());
         assert_eq!(r.next_message(), Err(Error::TooBig));
+    }
+
+    #[test]
+    fn session_ids_are_checked() {
+        assert!(is_session_id("0123456789ab"));
+        for bad in [
+            "",
+            "0123456789a",
+            "0123456789AB",
+            "../../etc/pa",
+            "0123456789abc",
+        ] {
+            assert!(!is_session_id(bad), "{bad}");
+            let f = Message::Session {
+                id: bad.into(),
+                windows: Vec::new(),
+            }
+            .encode();
+            assert_eq!(
+                Message::decode(f.get(4..).unwrap_or_default()),
+                Err(Error::Invalid("session id"))
+            );
+        }
+        // A window count over the limit is refused before anything is read.
+        let mut f = vec![76];
+        f.extend_from_slice(&12u32.to_le_bytes());
+        f.extend_from_slice(b"0123456789ab");
+        f.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(Message::decode(&f), Err(Error::Invalid("window count")));
     }
 
     #[test]

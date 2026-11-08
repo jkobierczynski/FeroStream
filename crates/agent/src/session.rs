@@ -10,6 +10,10 @@
 //! XFixes reports pointer-shape changes, which go to the client as images,
 //! and clipboard changes, whose text goes too. Text copied on Windows is
 //! offered to programs with the agent as the selection owner.
+//!
+//! A client may go away and another come (a reconnect): without one, frames
+//! are dropped and changes pile up as dirty rectangles; a new client gets
+//! every window announced again and its pixels in full ([`Session::attach`]).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -42,6 +46,10 @@ const MAX_IN_FLIGHT: u32 = 2;
 /// More damaged rectangles than this in one window are sent as their
 /// bounding box.
 const MAX_RECTS: usize = 32;
+
+/// More damaged rectangles than this waiting in one window (no client to
+/// send them to) become the whole window.
+const MAX_DIRTY: usize = 256;
 
 /// Drawing must pause this long before pixels are read...
 const SETTLE_QUIET: Duration = Duration::from_millis(4);
@@ -96,6 +104,15 @@ struct State {
     monitors: Vec<xproto::Atom>,
 }
 
+/// Where frames go: the attached client, or nowhere while the session is
+/// detached.
+struct Out {
+    sink: Option<Box<dyn Sink>>,
+    /// Counts attaches, so a client that went away cannot detach the one
+    /// that took its place.
+    generation: u64,
+}
+
 /// Writes frames to the client.
 pub trait Sink: Send {
     fn send(&mut self, frames: &[Message]) -> std::io::Result<()>;
@@ -134,7 +151,7 @@ pub struct Session {
     dpi: u16,
     state: Mutex<State>,
     keyboard: Mutex<Keyboard>,
-    out: Mutex<Box<dyn Sink>>,
+    out: Mutex<Out>,
     /// Damage arrived since the event loop last looked.
     fresh_damage: AtomicBool,
 }
@@ -155,12 +172,8 @@ fn err(e: impl std::fmt::Display) -> String {
 
 impl Session {
     /// Sets up redirection and event selection on a fresh display.
-    pub fn new(
-        conn: RustConnection,
-        screen: usize,
-        dpi: u16,
-        out: Box<dyn Sink>,
-    ) -> Result<Arc<Session>, String> {
+    /// No client is attached yet: see [`Session::attach`].
+    pub fn new(conn: RustConnection, screen: usize, dpi: u16) -> Result<Arc<Session>, String> {
         let root = conn
             .setup()
             .roots
@@ -324,20 +337,109 @@ impl Session {
             dpi,
             state: Mutex::new(State::default()),
             keyboard: Mutex::new(keyboard),
-            out: Mutex::new(out),
+            out: Mutex::new(Out {
+                sink: None,
+                generation: 0,
+            }),
             fresh_damage: AtomicBool::new(false),
         }))
     }
 
+    /// Sends to the attached client. A client that cannot take frames any
+    /// more is let go: the session goes on without one (detached).
     fn send(&self, frames: &[Message]) -> Result<(), String> {
-        lock(&self.out)
-            .send(frames)
-            .map_err(|e| format!("the client went away: {e}"))
+        let mut out = lock(&self.out);
+        if let Some(sink) = out.sink.as_mut()
+            && sink.send(frames).is_err()
+        {
+            out.sink = None;
+        }
+        Ok(())
     }
 
     /// Sends the last message of the session.
     pub fn finish(&self, last: &Message) {
-        let _ = lock(&self.out).send(std::slice::from_ref(last));
+        if let Some(sink) = lock(&self.out).sink.as_mut() {
+            let _ = sink.send(std::slice::from_ref(last));
+        }
+    }
+
+    /// Whether a client is attached.
+    pub fn attached(&self) -> bool {
+        lock(&self.out).sink.is_some()
+    }
+
+    /// Makes `sink` the session's client, in place of any other, and tells
+    /// it everything a new client needs: [`Message::Session`], every window
+    /// as if it were new, the pointer shape; the pixels follow. Returns the
+    /// attach's number for [`Session::detach`].
+    pub fn attach(&self, mut sink: Box<dyn Sink>, id: &str) -> u64 {
+        // Holding `out` throughout: whatever the event thread sends meanwhile
+        // (a window that just appeared) waits and comes after this.
+        let mut out = lock(&self.out);
+        let windows: Vec<(u32, i16, i16, u16, u16, bool, WindowState)> = {
+            let mut st = lock(&self.state);
+            st.cursor = None;
+            for w in st.windows.values_mut() {
+                w.dirty = vec![w.full()];
+                w.sent = 0;
+                w.acked = 0;
+            }
+            st.windows
+                .iter()
+                .map(|(&id, w)| (id, w.x, w.y, w.w, w.h, w.popup, w.state))
+                .collect()
+        };
+        let mut frames = vec![Message::Session {
+            id: id.into(),
+            windows: windows.iter().map(|w| w.0).collect(),
+        }];
+        for (window, x, y, width, height, popup, state) in windows {
+            let (kind, transient_for) = self.kind(window, popup);
+            frames.push(Message::WindowNew {
+                window,
+                x: i32::from(x),
+                y: i32::from(y),
+                width,
+                height,
+                kind,
+                transient_for,
+                title: self.title(window),
+            });
+            if !popup {
+                frames.push(self.hints(window));
+                frames.extend(self.icons(window));
+                if state != WindowState::Normal {
+                    frames.push(Message::WindowState { window, state });
+                }
+            }
+        }
+        if let Some((serial, m)) = self.cursor_message() {
+            lock(&self.state).cursor = Some(serial);
+            frames.push(m);
+        }
+        let ok = sink.send(&frames).is_ok();
+        out.generation += 1;
+        out.sink = ok.then_some(sink);
+        let generation = out.generation;
+        drop(out);
+        self.wake();
+        generation
+    }
+
+    /// The client of attach number `generation` went away. Returns whether
+    /// the session is now detached (`false`: another client has taken over).
+    pub fn detach(&self, generation: u64) -> bool {
+        let mut out = lock(&self.out);
+        if out.generation != generation {
+            return false;
+        }
+        out.sink = None;
+        drop(out);
+        // Keys the client held when it went away would stay down.
+        lock(&self.keyboard).release_all(&self.conn, self.root);
+        let _ = self.conn.flush();
+        true
     }
 
     /// Wakes the event thread.
@@ -428,12 +530,16 @@ impl Session {
                 self.fresh_damage.store(true, Ordering::Relaxed);
                 let mut st = lock(&self.state);
                 if let Some(w) = st.windows.get_mut(&e.drawable) {
-                    w.dirty.push(Rect {
-                        x: e.area.x.max(0) as u16,
-                        y: e.area.y.max(0) as u16,
-                        w: e.area.width,
-                        h: e.area.height,
-                    });
+                    if w.dirty.len() >= MAX_DIRTY {
+                        w.dirty = vec![w.full()];
+                    } else {
+                        w.dirty.push(Rect {
+                            x: e.area.x.max(0) as u16,
+                            y: e.area.y.max(0) as u16,
+                            w: e.area.width,
+                            h: e.area.height,
+                        });
+                    }
                 }
             }
             Event::XfixesCursorNotify(e) if lock(&self.state).cursor != Some(e.cursor_serial) => {
@@ -507,13 +613,7 @@ impl Session {
             .damage_create(damage, window, damage::ReportLevel::DELTA_RECTANGLES)
             .map_err(err)?;
         let title = self.title(window);
-        let transient_for = self.transient_for(window);
-        let kind = if override_redirect {
-            WindowKind::Popup
-        } else {
-            let types = self.atom_list(window, self.wm.net_wm_window_type);
-            self.wm.kind(&types, transient_for != 0)
-        };
+        let (kind, transient_for) = self.kind(window, override_redirect);
         let state = if kind == WindowKind::Popup {
             WindowState::Normal
         } else {
@@ -552,6 +652,18 @@ impl Session {
             }
         }
         self.send(&frames)
+    }
+
+    /// What kind of window it is, and the window it belongs to (or 0).
+    fn kind(&self, window: xproto::Window, override_redirect: bool) -> (WindowKind, u32) {
+        let transient_for = self.transient_for(window);
+        let kind = if override_redirect {
+            WindowKind::Popup
+        } else {
+            let types = self.atom_list(window, self.wm.net_wm_window_type);
+            self.wm.kind(&types, transient_for != 0)
+        };
+        (kind, transient_for)
     }
 
     /// A list of atoms in a window property (a window type, a state).
@@ -840,9 +952,16 @@ impl Session {
 
     /// Sends the pointer shape the display shows now.
     fn send_cursor(&self) -> Result<(), String> {
-        let Ok(Ok(c)) = self.conn.xfixes_get_cursor_image().map(|c| c.reply()) else {
+        let Some((serial, m)) = self.cursor_message() else {
             return Ok(());
         };
+        lock(&self.state).cursor = Some(serial);
+        self.send(&[m])
+    }
+
+    /// The pointer shape the display shows now, with its XFixes serial.
+    fn cursor_message(&self) -> Option<(u32, Message)> {
+        let c = self.conn.xfixes_get_cursor_image().ok()?.reply().ok()?;
         let count = usize::from(c.width) * usize::from(c.height);
         if c.width == 0
             || c.height == 0
@@ -850,15 +969,17 @@ impl Session {
             || c.height > MAX_IMAGE_SIDE
             || c.cursor_image.len() != count
         {
-            return Ok(());
+            return None;
         }
-        lock(&self.state).cursor = Some(c.cursor_serial);
         let pixels = image::from_premultiplied_argb(&c.cursor_image);
-        self.send(&[Message::Cursor {
-            hot_x: c.xhot.min(c.width - 1),
-            hot_y: c.yhot.min(c.height - 1),
-            image: Image::new(c.width, c.height, &pixels),
-        }])
+        Some((
+            c.cursor_serial,
+            Message::Cursor {
+                hot_x: c.xhot.min(c.width - 1),
+                hot_y: c.yhot.min(c.height - 1),
+                image: Image::new(c.width, c.height, &pixels),
+            },
+        ))
     }
 
     fn remove_window(&self, window: xproto::Window, alive: bool) -> Result<(), String> {
@@ -911,6 +1032,10 @@ impl Session {
 
     /// Sends what changed in every window that is not waiting on the client.
     fn flush_damage(&self) -> Result<(), String> {
+        // Detached: the changes wait for the next client.
+        if !self.attached() {
+            return Ok(());
+        }
         let mut work = Vec::new();
         {
             let mut st = lock(&self.state);
