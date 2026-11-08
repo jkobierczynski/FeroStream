@@ -50,6 +50,12 @@ jobs:
           FEROSTREAM_REQUIRE_X: "1"
       # One static binary that runs on any x86-64 Linux.
       - run: cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
+      # And one for 64-bit ARM (Raspberry Pi OS, Graviton), linked by
+      # rust-lld: no cross C toolchain needed.
+      - run: rustup target add aarch64-unknown-linux-musl
+      - run: cargo build --release --locked -p ferostream-agent --target aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
       - name: Report agent size
         run: |
           size=$(stat -c %s target/x86_64-unknown-linux-musl/release/ferostream-agent)
