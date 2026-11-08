@@ -27,7 +27,7 @@ will.
 ## Status
 
 Steps 1 to 3 of the [plan](https://claude.ai/artifact/256vVGrd767CWXCAcpPEd1):
-windows appear, pixels stream (LZ4 tiles), mouse and keyboard work, titles
+windows appear, pixels stream (packed tiles, see below), mouse and keyboard work, titles
 and icons show on the taskbar, text is sized for your screen's scaling, the
 pointer takes the program's shapes, dialogs stay above their window, menus
 and tooltips have no frame, size limits hold, and minimise, maximise and
@@ -36,8 +36,18 @@ know your screen layout, and open menus close when you click into another
 Windows program. Closing the window or exiting the program ends the
 session. The agent copies itself to the host when needed, and a program
 keeps running when the connection drops: its windows come back when the
-client reconnects. Not yet: screens with different scaling, smarter
-compression, QUIC.
+client reconnects. Not yet: screens with different scaling, QUIC.
+
+Pictures stay small: the agent keeps a copy of what the client shows and
+sends only pixels that really changed. A scroll (a terminal, a list, a web
+page) goes as a copy of pixels the client already has. Each tile is packed
+the way that suits it: one colour in 3 bytes, a palette of up to 256
+colours (text, menus, toolbars), or colour rows with small differences
+(photos, gradients). Then it is compressed with LZ4 (fast, little CPU) or
+Deflate (fewest bytes). `--packing auto` (the default) picks from the link
+speed it measures, and `fast` or `strong` fix the choice. Scrolling 60
+lines in xterm took 459 KB with plain LZ4 tiles. Now it takes 26 KB with
+`fast` and 23 KB with `strong`.
 
 Copied text: what a program copies lands on the Windows clipboard; what you
 copy on Windows reaches the host when you switch to one of its windows
@@ -128,7 +138,8 @@ same limit.)
   --check-sandbox` shows what a host enforces and tries the forbidden
   things.
 - Fuzzed (`fuzz/`): frame decoding, the decoder a sandboxed client runs
-  (upload request, frames, LZ4), and the window properties the agent reads
+  (upload request, frames, every tile encoding), packing and unpacking
+  tiles, and the window properties the agent reads
   from programs (size hints, icons).
 
 ## Embedding the client
