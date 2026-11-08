@@ -28,9 +28,7 @@ use ferostream_proto::{SESSION_ID_LEN, is_session_id};
 /// The base directory, made when missing and refused when it is not this
 /// user's alone (someone else could otherwise reach the sessions).
 pub fn base() -> Result<PathBuf, String> {
-    let uid = fs::metadata("/proc/self")
-        .map_err(|e| format!("cannot read /proc/self: {e}"))?
-        .uid();
+    let uid = rustix::process::getuid().as_raw();
     let dir = match std::env::var_os("FEROSTREAM_RUNTIME_DIR") {
         Some(d) => PathBuf::from(d),
         None => std::env::temp_dir().join(format!("ferostream-{uid}")),
@@ -74,8 +72,8 @@ pub fn remove_agent_if_idle(base: &Path) {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with("ferostream-agent") && !n.contains(' '));
-    let uid = fs::metadata("/proc/self").map(|m| m.uid()).ok();
-    let ours = fs::symlink_metadata(&me).is_ok_and(|m| m.is_file() && Some(m.uid()) == uid);
+    let uid = rustix::process::getuid().as_raw();
+    let ours = fs::symlink_metadata(&me).is_ok_and(|m| m.is_file() && m.uid() == uid);
     if named && ours {
         let _ = fs::remove_file(&me);
     }

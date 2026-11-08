@@ -111,4 +111,8 @@ jobs:
           tool: cargo-fuzz
       # Inputs that once crashed a target start its corpus.
       - run: mkdir -p fuzz/corpus && cp -r fuzz/regressions/. fuzz/corpus/
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu frame_decode -- -max_total_time=60
+      - run: |
+          for target in frame_decode client_decoder window_properties; do
+            mkdir -p "fuzz/corpus/$target"
+            cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60
+          done

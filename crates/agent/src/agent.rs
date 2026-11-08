@@ -29,7 +29,7 @@ use crate::xserver::XServer;
 const SOFTWARE: &str = concat!("ferostream-agent ", env!("CARGO_PKG_VERSION"));
 
 const USAGE: &str = "usage: ferostream-agent --stdio [--attach [ID]] [--remove-when-done]
-       ferostream-agent --list | --stop ID
+       ferostream-agent --list | --stop ID | --check-sandbox
 
 Speaks the FeroStream protocol on stdin and stdout. Start it through
 ferostream.exe (or another FeroStream client), not by hand.
@@ -39,6 +39,7 @@ ferostream.exe (or another FeroStream client), not by hand.
   --stdio --attach ID  take over session ID
   --list             the sessions running for this user
   --stop ID          end session ID (its program is stopped)
+  --check-sandbox    show how a session is locked down on this host
   --remove-when-done delete this agent's file once its session ends and
                      no other session of this user runs";
 
@@ -69,6 +70,14 @@ pub fn main() -> ExitCode {
             }
         },
         ["--list"] => list(),
+        #[cfg(target_os = "linux")]
+        ["--check-sandbox"] => match runtime::base() {
+            Ok(base) => crate::harden::check(&base),
+            Err(e) => {
+                eprintln!("ferostream-agent: {e}");
+                ExitCode::FAILURE
+            }
+        },
         ["--stop", id] if is_session_id(id) => stop(id),
         ["--version" | "-V"] => {
             println!("{SOFTWARE} (protocol {VERSION})");
@@ -372,6 +381,10 @@ fn serve_in(dir: &Path, id: &str) -> Result<i32, String> {
         }
     }
 
+    // Everything this process starts has started: from here on it only
+    // reads its clients and the display, and may not do more.
+    lock_down(dir);
+
     let clients = Arc::new(Clients {
         session: Arc::clone(&session),
         id: id.to_string(),
@@ -425,6 +438,25 @@ fn serve_in(dir: &Path, id: &str) -> Result<i32, String> {
     lock(&running).stop();
     Ok(code)
 }
+
+/// Locks the session process down ([`crate::harden`]): files only in the
+/// sessions' directory, and removing the agent's own file when asked.
+#[cfg(target_os = "linux")]
+fn lock_down(dir: &Path) {
+    let base = dir.parent().unwrap_or(dir);
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(Path::parent);
+    let report = crate::harden::lock_down(&crate::harden::Files {
+        own: vec![base],
+        remove_in: exe_dir.into_iter().collect(),
+    });
+    for line in report.lines() {
+        eprintln!("ferostream-agent: sandbox: {line}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_down(_dir: &Path) {}
 
 /// The session's clients: at most one at a time.
 struct Clients {

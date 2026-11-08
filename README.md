@@ -115,6 +115,21 @@ same limit.)
   does.
 - The agent the client copies is checked on the host (size and CRC) before
   it replaces the old one; a transfer that breaks off leaves the old agent.
+- The agent locks itself down on Linux once it has started Xvfb and your
+  program (which keeps your normal rights, as with `ssh -X`). The session
+  process and the stdio relay run with no new privileges, are not
+  dumpable (no ptrace from your other processes, no core files), and carry
+  a seccomp filter: no `execve`, no sockets but Unix ones, no ptrace,
+  namespaces, BPF, io_uring, keyrings, module loading or `TIOCSTI`.
+  Landlock (Linux 5.13 and later) confines their files to
+  `/tmp/ferostream-<uid>/` (plus deleting the agent's own file with
+  `--remove-when-done`; the relay gets no files at all), and refuses TCP
+  and other processes' abstract Unix sockets. `ferostream-agent
+  --check-sandbox` shows what a host enforces and tries the forbidden
+  things.
+- Fuzzed (`fuzz/`): frame decoding, the decoder a sandboxed client runs
+  (upload request, frames, LZ4), and the window properties the agent reads
+  from programs (size hints, icons).
 
 ## Embedding the client
 

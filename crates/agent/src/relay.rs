@@ -38,6 +38,9 @@ pub fn run(target: &Target, remove: bool) -> ExitCode {
         if remove {
             let _ = fs::write(dir.join(runtime::REMOVE_MARK), b"");
         }
+        // From here on it only passes bytes: no files, no programs.
+        #[cfg(target_os = "linux")]
+        let _ = crate::harden::lock_down(&crate::harden::Files::default());
         sock
     });
     match found.and_then(pass_through) {

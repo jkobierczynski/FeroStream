@@ -859,6 +859,36 @@ fn picture(a: &mut Agent, window: u32) -> usize {
     tiles
 }
 
+/// Whether process `pid` runs with no new privileges and a seccomp filter.
+fn assert_locked(pid: &str, locked: bool) {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (nnp, seccomp) = if locked { ("1", "2") } else { ("0", "0") };
+    assert_eq!(field("NoNewPrivs:"), nnp, "process {pid}: {status}");
+    assert_eq!(field("Seccomp:"), seccomp, "process {pid}: {status}");
+}
+
+#[test]
+fn check_sandbox_refuses_programs_and_the_network() {
+    let runtime = Runtime::new();
+    let out = runtime.agent().arg("--check-sandbox").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("start a program: refused"), "{text}");
+    assert!(text.contains("open a network socket: refused"), "{text}");
+    assert!(
+        text.contains("write in the session directory: works"),
+        "{text}"
+    );
+}
+
 fn session_list(runtime: &Runtime) -> String {
     let out = runtime.agent().arg("--list").output().unwrap();
     assert!(out.status.success());
@@ -888,6 +918,28 @@ fn session_survives_a_dropped_connection() {
     let dir = runtime.session_dir(&id);
     assert!(dir.join("sock").exists());
     assert!(session_list(&runtime).contains("attached"));
+
+    // The session process and the relay are locked down; the program the
+    // user asked for is not.
+    let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+    let pid = pid.trim();
+    assert_locked(pid, true);
+    assert_locked(&a.child.id().to_string(), true);
+    let program = std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|p| {
+            std::fs::read_to_string(format!("/proc/{p}/status")).is_ok_and(|s| {
+                s.lines()
+                    .any(|l| l.starts_with("Name:") && l.contains("xterm"))
+                    && s.lines().any(|l| l.split_whitespace().eq(["PPid:", pid]))
+            })
+        })
+        .expect("the session's xterm");
+    assert_locked(&program, false);
+    let log = std::fs::read_to_string(dir.join("log")).unwrap();
+    assert!(log.contains("sandbox: seccomp: on"), "{log}");
 
     // The connection drops (ssh killed): the session stays, detached.
     a.child.kill().unwrap();
