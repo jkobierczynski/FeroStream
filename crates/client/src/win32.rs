@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::windows::process::CommandExt as _;
 use std::process::ExitCode;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use ferostream_proto::{Message, VERSION, WindowKind, WindowState};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -44,16 +44,22 @@ use crate::clip;
 use crate::fb::Framebuffer;
 use crate::keys;
 use crate::link::{Event, Link};
-use crate::transport::{Clipboard, Options, ssh_command};
+use crate::reconnect;
+use crate::transport::{AgentFile, AttachTo, Clipboard, Options, find_agent_files, ssh_command};
 
 const WM_LINK: u32 = WM_APP + 1;
+/// Timer on the message-only window: time to try reconnecting.
+const RECONNECT_TIMER: usize = 1;
 const CLASS: PCWSTR = w!("FeroStreamWindow");
 const MSG_CLASS: PCWSTR = w!("FeroStreamLink");
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SOFTWARE: &str = concat!("ferostream ", env!("CARGO_PKG_VERSION"));
 
-/// What the reader thread has delivered and the UI thread not yet handled.
-static QUEUE: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
+/// What the reader thread has delivered and the UI thread not yet handled,
+/// with the number of the link it came from.
+static QUEUE: Mutex<VecDeque<(u32, Event)>> = Mutex::new(VecDeque::new());
+/// Number of the current link; events from links before it are dropped.
+static LINK_NUMBER: AtomicU32 = AtomicU32::new(0);
 /// The message-only window `WM_LINK` goes to.
 static LINK_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -79,6 +85,9 @@ struct Remote {
     icons: [Option<HICON>; 2],
     /// While full screen: the style and frame to go back to.
     restore: Option<(i32, RECT)>,
+    /// The program's title for the window (shown with a note while the
+    /// connection is down).
+    title: String,
 }
 
 impl Remote {
@@ -103,6 +112,15 @@ impl Remote {
 #[derive(Debug)]
 struct App {
     link: Link,
+    options: Options,
+    /// Agents the client can copy to the host.
+    files: Vec<AgentFile>,
+    /// The session on the host, once it has said its id.
+    session: Option<String>,
+    /// The connection is down: reconnect attempts made so far.
+    away: Option<u32>,
+    /// The user closed the last window while the connection was down.
+    left_running: bool,
     windows: HashMap<u32, Remote>,
     by_hwnd: HashMap<isize, u32>,
     /// Top-left of the Windows virtual screen; remote (0,0) maps here.
@@ -212,27 +230,16 @@ pub fn run(options: Options) -> ExitCode {
     };
     LINK_HWND.store(link_hwnd.0 as isize, Ordering::SeqCst);
 
-    let mut cmd = ssh_command(&options);
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    // ssh has no console to ask for a password or a host-key answer in, so
-    // it asks us: this exe in askpass mode shows a small dialog.
-    if let Ok(me) = std::env::current_exe() {
-        cmd.env("SSH_ASKPASS", me)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env(crate::askpass::ENV, "1");
-    }
-    let link = match Link::start(cmd, |event| {
-        let mut q = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
-        let was_empty = q.is_empty();
-        q.push_back(event);
-        drop(q);
-        if was_empty {
-            let hwnd = HWND(LINK_HWND.load(Ordering::SeqCst) as *mut _);
-            unsafe {
-                let _ = PostMessageW(Some(hwnd), WM_LINK, WPARAM(0), LPARAM(0));
-            }
-        }
-    }) {
+    // The agent for the host ships next to this exe.
+    let files = if options.install && options.agent.is_none() {
+        std::env::current_exe()
+            .ok()
+            .and_then(|me| me.parent().map(find_agent_files))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let link = match start_link(&options, &files, &options.attach) {
         Ok(l) => l,
         Err(e) => {
             message_box(
@@ -244,39 +251,26 @@ pub fn run(options: Options) -> ExitCode {
         }
     };
 
-    let (ox, oy, vw, vh) = unsafe {
+    let (ox, oy) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
             GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
     };
-    let side = |v: i32| v.clamp(640, i32::from(ferostream_proto::MAX_WINDOW_SIDE)) as u16;
-    link.send(Message::Hello {
-        version: VERSION,
-        software: SOFTWARE.into(),
-    });
-    link.send(Message::Start {
-        width: side(vw),
-        height: side(vh),
-        // The primary screen's scaling; the remote display has one DPI.
-        dpi: (unsafe { GetDpiForSystem() } as u16)
-            .clamp(ferostream_proto::MIN_DPI, ferostream_proto::MAX_DPI),
-        argv: options.program.clone(),
-    });
-
+    // Hello, Start and the screens go once the agent has answered: before
+    // that, the host may still be taking the agent binary.
     let screens = monitors((ox, oy));
-    if !screens.is_empty() {
-        link.send(Message::Monitors {
-            monitors: screens.clone(),
-        });
-    }
+    let clipboard = options.clipboard;
 
     let grey = unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0080_8080)) };
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
             link,
+            options,
+            files,
+            session: None,
+            away: None,
+            left_running: false,
             windows: HashMap::new(),
             by_hwnd: HashMap::new(),
             origin: (ox, oy),
@@ -288,7 +282,7 @@ pub fn run(options: Options) -> ExitCode {
             altgr: false,
             high_surrogate: None,
             cursor: None,
-            clipboard: options.clipboard,
+            clipboard,
             clip_seq: 0,
             last_clip: None,
             monitors: screens,
@@ -307,15 +301,51 @@ pub fn run(options: Options) -> ExitCode {
         }
     }
 
-    let (code, problem) = APP.with(|a| {
+    let (code, problem, note) = APP.with(|a| {
         let app = a.borrow_mut().take();
-        app.map(|app| (app.exit_code, app.problem))
-            .unwrap_or((1, None))
+        app.map(|app| {
+            let note = app
+                .session
+                .as_deref()
+                .filter(|_| app.left_running)
+                .map(|id| reconnect::left_running(&app.options.destination, id));
+            (app.exit_code, app.problem, note)
+        })
+        .unwrap_or((1, None, None))
     });
     if let Some(p) = problem {
         message_box("FeroStream", &p, true);
+    } else if let Some(n) = note {
+        message_box("FeroStream", &n, false);
     }
     ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+/// Starts ssh and the agent for session `attach`. Its events go to the UI
+/// thread tagged with a new link number; older links' events are dropped.
+fn start_link(options: &Options, files: &[AgentFile], attach: &AttachTo) -> std::io::Result<Link> {
+    let mut cmd = ssh_command(options, files, attach);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    // ssh has no console to ask for a password or a host-key answer in, so
+    // it asks us: this exe in askpass mode shows a small dialog.
+    if let Ok(me) = std::env::current_exe() {
+        cmd.env("SSH_ASKPASS", me)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env(crate::askpass::ENV, "1");
+    }
+    let number = LINK_NUMBER.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    Link::start(cmd, files.to_vec(), move |event| {
+        let mut q = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+        let was_empty = q.is_empty();
+        q.push_back((number, event));
+        drop(q);
+        if was_empty {
+            let hwnd = HWND(LINK_HWND.load(Ordering::SeqCst) as *mut _);
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_LINK, WPARAM(0), LPARAM(0));
+            }
+        }
+    })
 }
 
 /// Runs `f` on the app state, or returns `None` when it is already borrowed
@@ -331,7 +361,10 @@ extern "system" fn link_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
     if msg == WM_LINK {
         loop {
             let next = QUEUE.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
-            let Some(event) = next else { break };
+            let Some((number, event)) = next else { break };
+            if number != LINK_NUMBER.load(Ordering::SeqCst) {
+                continue;
+            }
             let quit = with_app(|app| app.on_event(event)).unwrap_or(false);
             if quit {
                 unsafe { PostQuitMessage(0) };
@@ -340,14 +373,126 @@ extern "system" fn link_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         }
         return LRESULT(0);
     }
+    if msg == WM_TIMER && wparam.0 == RECONNECT_TIMER {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), RECONNECT_TIMER);
+        }
+        with_app(App::reconnect);
+        return LRESULT(0);
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 impl App {
+    /// The connection is down but the session lives on the host: keep the
+    /// windows, mark them, and try again after a while.
+    fn lost(&mut self) {
+        let attempt = match self.away {
+            Some(n) => n,
+            None => {
+                self.release_held();
+                for r in self.windows.values() {
+                    if r.kind != WindowKind::Popup {
+                        unsafe {
+                            let _ = SetWindowTextW(
+                                r.hwnd,
+                                &utf16(&reconnect::title_while_away(&r.title)),
+                            );
+                        }
+                    }
+                }
+                0
+            }
+        };
+        self.away = Some(attempt + 1);
+        let ms = reconnect::delay(attempt).as_millis() as u32;
+        let hwnd = HWND(LINK_HWND.load(Ordering::SeqCst) as *mut _);
+        unsafe {
+            SetTimer(Some(hwnd), RECONNECT_TIMER, ms, None);
+        }
+    }
+
+    /// Tries to reach the session again.
+    fn reconnect(&mut self) {
+        let Some(id) = self.session.clone() else {
+            return;
+        };
+        match start_link(&self.options, &self.files, &AttachTo::Id(id)) {
+            Ok(link) => self.link = link,
+            Err(_) => self.lost(),
+        }
+    }
+
+    /// The agent answered: say who we are and what we want.
+    fn greet(&mut self) {
+        self.link.send(Message::Hello {
+            version: VERSION,
+            software: SOFTWARE.into(),
+        });
+        if self.session.is_some() || self.options.attach != AttachTo::New {
+            self.link.send(Message::Attach);
+        } else {
+            let (vw, vh) = unsafe {
+                (
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                )
+            };
+            let side = |v: i32| v.clamp(640, i32::from(ferostream_proto::MAX_WINDOW_SIDE)) as u16;
+            self.link.send(Message::Start {
+                width: side(vw),
+                height: side(vh),
+                // The primary screen's scaling; the remote display has one DPI.
+                dpi: (unsafe { GetDpiForSystem() } as u16)
+                    .clamp(ferostream_proto::MIN_DPI, ferostream_proto::MAX_DPI),
+                argv: self.options.program.clone(),
+            });
+        }
+        if !self.monitors.is_empty() {
+            self.link.send(Message::Monitors {
+                monitors: self.monitors.clone(),
+            });
+        }
+    }
+
+    /// The session is (back) up. After a reconnect, windows it no longer
+    /// has go, and the others lose their note.
+    fn session_ready(&mut self, id: String, windows: &[u32]) {
+        self.session = Some(id);
+        if self.away.take().is_none() {
+            return;
+        }
+        for window in reconnect::stale(self.windows.keys().copied(), windows) {
+            self.destroy(window);
+        }
+        for r in self.windows.values() {
+            unsafe {
+                let _ = SetWindowTextW(r.hwnd, &utf16(&r.title));
+            }
+        }
+    }
+
+    fn destroy(&mut self, window: u32) {
+        if let Some(r) = self.windows.remove(&window) {
+            self.by_hwnd.remove(&(r.hwnd.0 as isize));
+            unsafe {
+                let _ = DestroyWindow(r.hwnd);
+                for icon in r.icons.into_iter().flatten() {
+                    let _ = DestroyIcon(icon);
+                }
+            }
+        }
+    }
+
     /// Handles one event from the transport; `true` ends the program.
     fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Message(m) => self.on_message(m),
+            Event::Closed { .. } if !self.ended && self.session.is_some() => {
+                // The program goes on on the host; so do we.
+                self.lost();
+                false
+            }
             Event::Closed { error, stderr } => {
                 if !self.ended {
                     let mut text = String::from("The connection to the host ended.");
@@ -376,6 +521,8 @@ impl App {
                 self.ended = true;
                 return true;
             }
+            Message::Hello { .. } => self.greet(),
+            Message::Session { id, windows } => self.session_ready(id, &windows),
             Message::WindowNew {
                 window,
                 x,
@@ -405,23 +552,14 @@ impl App {
                 }
             }
             Message::WindowTitle { window, title } => {
-                if let Some(r) = self.windows.get(&window) {
+                if let Some(r) = self.windows.get_mut(&window) {
                     unsafe {
                         let _ = SetWindowTextW(r.hwnd, &utf16(&title));
                     }
+                    r.title = title;
                 }
             }
-            Message::WindowGone { window } => {
-                if let Some(r) = self.windows.remove(&window) {
-                    self.by_hwnd.remove(&(r.hwnd.0 as isize));
-                    unsafe {
-                        let _ = DestroyWindow(r.hwnd);
-                        for icon in r.icons.into_iter().flatten() {
-                            let _ = DestroyIcon(icon);
-                        }
-                    }
-                }
-            }
+            Message::WindowGone { window } => self.destroy(window),
             Message::Tile(t) => {
                 if let Some(r) = self.windows.get_mut(&t.window) {
                     r.pending.push(t);
@@ -526,7 +664,33 @@ impl App {
         transient_for: u32,
         title: &str,
     ) {
-        if self.windows.contains_key(&window) {
+        if let Some(r) = self.windows.get_mut(&window) {
+            // Announced again after a reconnect: the window stays where the
+            // user has it, and the agent hears where that is.
+            r.title = title.into();
+            unsafe {
+                let _ = SetWindowTextW(r.hwnd, &utf16(title));
+            }
+            if r.kind != WindowKind::Popup {
+                let hwnd = r.hwnd;
+                let mut client = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut client);
+                }
+                let (sx, sy) = client_origin(hwnd);
+                let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+                if !minimized && client.right > 0 && client.bottom > 0 {
+                    let side =
+                        |v: i32| v.clamp(1, i32::from(ferostream_proto::MAX_WINDOW_SIDE)) as u16;
+                    self.link.send(Message::WindowMove {
+                        window,
+                        x: sx - self.origin.0,
+                        y: sy - self.origin.1,
+                        width: side(client.right),
+                        height: side(client.bottom),
+                    });
+                }
+            }
             return;
         }
         let (style, ex) = styles(kind);
@@ -584,6 +748,7 @@ impl App {
                 state: WindowState::Normal,
                 icons: [None, None],
                 restore: None,
+                title: title.into(),
             },
         );
         self.by_hwnd.insert(hwnd.0 as isize, window);
@@ -1233,6 +1398,16 @@ fn on_window(
             None
         }
         WM_CLOSE => {
+            if app.away.is_some() {
+                // No program to ask: the window goes here, the program
+                // stays on the host; the last window closed ends the wait.
+                app.destroy(id);
+                if !app.windows.values().any(|r| r.kind != WindowKind::Popup) {
+                    app.left_running = true;
+                    unsafe { PostQuitMessage(0) };
+                }
+                return Some(LRESULT(0));
+            }
             // The program decides; the window goes when the agent says so.
             app.link.send(Message::WindowClose { window: id });
             Some(LRESULT(0))

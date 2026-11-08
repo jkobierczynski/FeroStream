@@ -11,6 +11,7 @@ pub mod cliptext;
 pub mod fb;
 pub mod keys;
 pub mod link;
+pub mod reconnect;
 pub mod transport;
 
 #[cfg(windows)]

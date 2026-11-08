@@ -1,5 +1,6 @@
 //! `ferostream-agent`: runs a Linux program on a private X display and
-//! streams its windows to a FeroStream client over stdin and stdout.
+//! streams its windows to a FeroStream client over stdin and stdout; the
+//! session outlives a dropped connection.
 
 #[cfg(unix)]
 mod agent;
@@ -7,6 +8,10 @@ mod agent;
 mod clipboard;
 #[cfg(unix)]
 mod keyboard;
+#[cfg(unix)]
+mod relay;
+#[cfg(unix)]
+mod runtime;
 #[cfg(unix)]
 mod scale;
 #[cfg(unix)]

@@ -1,9 +1,10 @@
 //! The private X display: Xvfb on a free display number, with a random
-//! cookie in an Xauthority file only this user can read.
+//! cookie in an Xauthority file only this user can read (in the session's
+//! own directory).
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,7 +17,6 @@ use x11rb::rust_connection::{DefaultStream, RustConnection};
 pub struct XServer {
     pub display: u32,
     pub child: Child,
-    pub dir: PathBuf,
     pub auth_file: PathBuf,
     pub cookie: [u8; 16],
 }
@@ -25,11 +25,11 @@ const FIRST_DISPLAY: u32 = 100;
 const LAST_DISPLAY: u32 = 399;
 
 impl XServer {
-    /// Starts Xvfb with a `width` x `height` screen at `dpi`.
-    pub fn start(width: u16, height: u16, dpi: u16) -> Result<XServer, String> {
+    /// Starts Xvfb with a `width` x `height` screen at `dpi`; its
+    /// Xauthority file goes in `dir`, a directory only this user can enter.
+    pub fn start(width: u16, height: u16, dpi: u16, dir: &Path) -> Result<XServer, String> {
         let mut cookie = [0u8; 16];
         getrandom::fill(&mut cookie).map_err(|e| format!("no random numbers: {e}"))?;
-        let dir = private_dir()?;
         let auth_file = dir.join("Xauthority");
         write_xauthority(&auth_file, &cookie)?;
 
@@ -68,7 +68,6 @@ impl XServer {
                     return Ok(XServer {
                         display,
                         child,
-                        dir,
                         auth_file,
                         cookie,
                     });
@@ -80,7 +79,7 @@ impl XServer {
                 }
             }
         }
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&auth_file);
         Err(last_err)
     }
 
@@ -118,7 +117,7 @@ impl XServer {
     pub fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_dir_all(&self.dir);
+        let _ = fs::remove_file(&self.auth_file);
     }
 }
 
@@ -153,24 +152,6 @@ fn lock_owner(display: u32) -> Option<u32> {
         .trim()
         .parse()
         .ok()
-}
-
-/// A fresh directory only this user can enter, under `$XDG_RUNTIME_DIR` when
-/// there is one, else `/tmp`.
-fn private_dir() -> Result<PathBuf, String> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    let mut tag = [0u8; 8];
-    getrandom::fill(&mut tag).map_err(|e| format!("no random numbers: {e}"))?;
-    let name: String = tag.iter().map(|b| format!("{b:02x}")).collect();
-    let dir = base.join(format!("ferostream-{name}"));
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|e| format!("could not make {}: {e}", dir.display()))?;
-    Ok(dir)
 }
 
 /// An Xauthority file with one entry that matches any display (family
