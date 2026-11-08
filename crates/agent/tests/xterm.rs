@@ -12,7 +12,7 @@
 )]
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
@@ -859,6 +859,36 @@ fn picture(a: &mut Agent, window: u32) -> usize {
     tiles
 }
 
+/// Whether process `pid` runs with no new privileges and a seccomp filter.
+fn assert_locked(pid: &str, locked: bool) {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (nnp, seccomp) = if locked { ("1", "2") } else { ("0", "0") };
+    assert_eq!(field("NoNewPrivs:"), nnp, "process {pid}: {status}");
+    assert_eq!(field("Seccomp:"), seccomp, "process {pid}: {status}");
+}
+
+#[test]
+fn check_sandbox_refuses_programs_and_the_network() {
+    let runtime = Runtime::new();
+    let out = runtime.agent().arg("--check-sandbox").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("start a program: refused"), "{text}");
+    assert!(text.contains("open a network socket: refused"), "{text}");
+    assert!(
+        text.contains("write in the session directory: works"),
+        "{text}"
+    );
+}
+
 fn session_list(runtime: &Runtime) -> String {
     let out = runtime.agent().arg("--list").output().unwrap();
     assert!(out.status.success());
@@ -888,6 +918,28 @@ fn session_survives_a_dropped_connection() {
     let dir = runtime.session_dir(&id);
     assert!(dir.join("sock").exists());
     assert!(session_list(&runtime).contains("attached"));
+
+    // The session process and the relay are locked down; the program the
+    // user asked for is not.
+    let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+    let pid = pid.trim();
+    assert_locked(pid, true);
+    assert_locked(&a.child.id().to_string(), true);
+    let program = std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|p| {
+            std::fs::read_to_string(format!("/proc/{p}/status")).is_ok_and(|s| {
+                s.lines()
+                    .any(|l| l.starts_with("Name:") && l.contains("xterm"))
+                    && s.lines().any(|l| l.split_whitespace().eq(["PPid:", pid]))
+            })
+        })
+        .expect("the session's xterm");
+    assert_locked(&program, false);
+    let log = std::fs::read_to_string(dir.join("log")).unwrap();
+    assert!(log.contains("sandbox: seccomp: on"), "{log}");
 
     // The connection drops (ssh killed): the session stays, detached.
     a.child.kill().unwrap();
@@ -994,4 +1046,72 @@ fn stop_and_check(runtime: &Runtime, id: &str) {
     assert!(status.success());
     assert!(!runtime.session_dir(id).exists());
     assert!(!session_list(runtime).contains(id));
+}
+
+/// `--remove-when-done`: a copied agent deletes its own file once its
+/// session ends, but not while another session still runs.
+#[test]
+fn copied_agent_removes_itself_when_done() {
+    if !need_x() {
+        return;
+    }
+    let runtime = Runtime::new();
+    let bin = runtime.0.with_extension("bin");
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let copy = bin.join("ferostream-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_ferostream-agent"), &copy).unwrap();
+
+    // Another session runs (started by the usual agent): the copy stays.
+    let other = Agent::start(&["xterm", "-geometry", "20x5"]);
+    let other_id = other.until(|m| match m {
+        Message::Session { id, .. } => Some(id),
+        _ => None,
+    });
+    let other_runtime = Arc::clone(&other.runtime);
+
+    let run_copy = |runtime: &Path| {
+        let mut child = Command::new(&copy)
+            .args(["--stdio", "--remove-when-done"])
+            .env("FEROSTREAM_RUNTIME_DIR", runtime)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        for m in [
+            Message::Hello {
+                version: VERSION,
+                software: "test".into(),
+            },
+            Message::Start {
+                width: 640,
+                height: 480,
+                dpi: 96,
+                argv: vec!["true".into()],
+            },
+        ] {
+            stdin.write_all(&m.encode()).unwrap();
+        }
+        stdin.flush().unwrap();
+        let mut out = Vec::new();
+        child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+        drop(stdin);
+        let _ = child.wait();
+        out
+    };
+
+    // Same runtime as the other session: it still runs, the file stays.
+    let out = run_copy(&other_runtime.0);
+    assert!(!out.is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(copy.exists(), "removed while another session runs");
+
+    // Its own runtime, no other session: the file goes.
+    run_copy(&runtime.0);
+    wait_for("the copied agent to remove itself", || !copy.exists());
+
+    stop_and_check(&other_runtime, &other_id);
+    drop(other);
+    let _ = std::fs::remove_dir_all(&bin);
 }

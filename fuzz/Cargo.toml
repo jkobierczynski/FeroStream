@@ -11,10 +11,25 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 ferostream-proto = { path = "../crates/proto" }
+ferostream-client = { path = "../crates/client" }
 
 [[bin]]
 name = "frame_decode"
 path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_decoder"
+path = "fuzz_targets/client_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "window_properties"
+path = "fuzz_targets/window_properties.rs"
 test = false
 doc = false
 bench = false

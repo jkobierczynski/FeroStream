@@ -9,6 +9,8 @@
 //!         detached                present while no client is attached
 //!         log                     its own and the program's error output
 //!         Xauthority              the display's cookie
+//!         remove-agent            present when a client asked for the
+//!                                 agent's file to go once it is done
 //! ```
 //!
 //! `/tmp`, not `$XDG_RUNTIME_DIR`: the latter is removed when the user's
@@ -26,9 +28,7 @@ use ferostream_proto::{SESSION_ID_LEN, is_session_id};
 /// The base directory, made when missing and refused when it is not this
 /// user's alone (someone else could otherwise reach the sessions).
 pub fn base() -> Result<PathBuf, String> {
-    let uid = fs::metadata("/proc/self")
-        .map_err(|e| format!("cannot read /proc/self: {e}"))?
-        .uid();
+    let uid = rustix::process::getuid().as_raw();
     let dir = match std::env::var_os("FEROSTREAM_RUNTIME_DIR") {
         Some(d) => PathBuf::from(d),
         None => std::env::temp_dir().join(format!("ferostream-{uid}")),
@@ -53,6 +53,30 @@ fn private_dir(dir: &Path, uid: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The file in a session directory that asks for the agent's removal.
+pub const REMOVE_MARK: &str = "remove-agent";
+
+/// Deletes this agent's file when no session of this user runs any more
+/// (`--remove-when-done`). Only a file named `ferostream-agent...` that
+/// this user owns goes: never one an administrator installed.
+pub fn remove_agent_if_idle(base: &Path) {
+    if !list(base).is_empty() {
+        return;
+    }
+    let Ok(me) = std::env::current_exe() else {
+        return;
+    };
+    let named = me
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("ferostream-agent") && !n.contains(' '));
+    let uid = rustix::process::getuid().as_raw();
+    let ours = fs::symlink_metadata(&me).is_ok_and(|m| m.is_file() && m.uid() == uid);
+    if named && ours {
+        let _ = fs::remove_file(&me);
+    }
 }
 
 /// A new session id.

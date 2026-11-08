@@ -70,7 +70,10 @@ copy (`cksum`: CRC and size) and, when it is missing or different, sends its
 copy over the same SSH connection, so there is one login. A file named
 `ferostream-agent-aarch64` (or another `uname -m`) next to the exe serves
 hosts of that kind. `--no-install` turns the copying off; `--agent PATH`
-uses an agent you installed yourself.
+uses an agent you installed yourself. `--install-to PATH` copies it
+somewhere else (`~/...` or an absolute path), and `--remove-agent` has the
+copied agent delete itself once its program ends and no other FeroStream
+session of yours runs on that host. The copy is executable by you only.
 
 KDE and Qt programs show their icons when the host has an icon theme
 (`sudo apt install breeze-icon-theme`); the agent tells them to use it.
@@ -112,6 +115,32 @@ same limit.)
   does.
 - The agent the client copies is checked on the host (size and CRC) before
   it replaces the old one; a transfer that breaks off leaves the old agent.
+- The agent locks itself down on Linux once it has started Xvfb and your
+  program (which keeps your normal rights, as with `ssh -X`). The session
+  process and the stdio relay run with no new privileges, are not
+  dumpable (no ptrace from your other processes, no core files), and carry
+  a seccomp filter: no `execve`, no sockets but Unix ones, no ptrace,
+  namespaces, BPF, io_uring, keyrings, module loading or `TIOCSTI`.
+  Landlock (Linux 5.13 and later) confines their files to
+  `/tmp/ferostream-<uid>/` (plus deleting the agent's own file with
+  `--remove-when-done`; the relay gets no files at all), and refuses TCP
+  and other processes' abstract Unix sockets. `ferostream-agent
+  --check-sandbox` shows what a host enforces and tries the forbidden
+  things.
+- Fuzzed (`fuzz/`): frame decoding, the decoder a sandboxed client runs
+  (upload request, frames, LZ4), and the window properties the agent reads
+  from programs (size hints, icons).
+
+## Embedding the client
+
+`ferostream-client` is also a library. `win32::start` runs a session inside
+another program's message loop (several at once), with a `win32::Host`
+that supplies the transport (any byte stream to `ferostream-agent
+--stdio`) and hears when the session ends. `decode::Decoder` takes the
+host's bytes apart (the agent upload request, then frames); with
+`unpack` on it hands out compressed tiles as raw pixels, so it can run in
+a separate sandboxed process while the window side accepts only raw tiles
+(`Settings::raw_only`). FeroSSH embeds the client this way.
 
 ## Building
 

@@ -36,6 +36,10 @@ options:
   --ssh PATH     the ssh program (default: Windows OpenSSH)
   --agent PATH   the agent's path on the host (it is not copied then)
   --no-install   never copy the agent to the host
+  --install-to PATH  where the agent is copied to on the host
+                 (default ~/.local/bin/ferostream-agent)
+  --remove-agent delete the copied agent from the host once its program
+                 ends and no other FeroStream session runs there
   --attach[=ID]  take over a session left running on the host
   --clipboard WAY  share copied text: both (default), to-host, from-host
                  or off. Text copied on Windows goes to the host when you
@@ -59,6 +63,8 @@ pub struct Options {
     pub attach: AttachTo,
     /// Copy the agent to the host when it is missing or different.
     pub install: bool,
+    /// Where the agent is installed on the host, and whether it goes.
+    pub place: Place,
 }
 
 /// Which session on the host the client wants.
@@ -195,45 +201,109 @@ pub fn cksum(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Where the agent lives on the host and whether it goes when done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    /// The agent's path for `sh`: `$HOME/...` or absolute, checked to need
+    /// no quoting ([`Place::new`]).
+    sh_path: String,
+    /// Delete the agent's file once its session ends and no other session
+    /// runs (`--remove-when-done`). Only for the agent at `sh_path`, never
+    /// one found on the host's `PATH`.
+    pub remove: bool,
+}
+
+/// The agent's place on the host unless told otherwise.
+pub const DEFAULT_AGENT_PATH: &str = "~/.local/bin/ferostream-agent";
+
+impl Default for Place {
+    fn default() -> Place {
+        Place {
+            sh_path: "$HOME/.local/bin/ferostream-agent".into(),
+            remove: false,
+        }
+    }
+}
+
+impl Place {
+    /// `path` is `~/...` or absolute, made of letters, digits and
+    /// `. _ - + /` (it goes into a shell command unquoted), without `..`.
+    pub fn new(path: &str, remove: bool) -> Result<Place, String> {
+        let (prefix, rest) = match path.strip_prefix("~/") {
+            Some(r) => ("$HOME/", r),
+            None => match path.strip_prefix('/') {
+                Some(r) => ("/", r),
+                None => return Err(format!("the agent's path must start with ~/ or /: {path}")),
+            },
+        };
+        let ok = !rest.is_empty()
+            && rest.len() <= 255
+            && !rest.ends_with('/')
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-+/".contains(&b))
+            && rest
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..");
+        if !ok {
+            return Err(format!(
+                "the agent's path may hold only letters, digits, . _ - + and /: {path}"
+            ));
+        }
+        Ok(Place {
+            sh_path: format!("{prefix}{rest}"),
+            remove,
+        })
+    }
+}
+
 /// The command ssh runs on the host. Wrapped in `sh -c '...'` so it works
 /// whatever the user's login shell is; the script has no single quote, and
 /// what goes into it (CRCs, sizes, architectures, session ids) is checked.
 ///
-/// With agent files: `~/.local/bin/ferostream-agent` is compared with ours
-/// for the host's architecture and replaced (atomically, checked again)
-/// when it differs. Without: `~/.local/bin` first, then PATH, because a
-/// non-interactive SSH shell often lacks `~/.local/bin` on PATH.
-pub fn remote_command(files: &[AgentFile], attach: &AttachTo) -> String {
-    let start = format!("exec \"$p\" {}", agent_args(attach).join(" "));
+/// With agent files: the agent at `place` (`~/.local/bin/ferostream-agent`
+/// unless told otherwise) is compared with ours for the host's
+/// architecture and replaced (atomically, checked again) when it differs.
+/// Without: `place` first, then PATH, because a non-interactive SSH shell
+/// often lacks `~/.local/bin` on PATH.
+///
+/// `place.remove` asks the agent at `place` to delete itself when done.
+pub fn remote_command(files: &[AgentFile], attach: &AttachTo, place: &Place) -> String {
+    let start = format!("exec \"$p\" {} $r", agent_args(attach).join(" "));
+    let head = format!(
+        "p={}; r={}",
+        place.sh_path,
+        if place.remove {
+            "--remove-when-done"
+        } else {
+            ""
+        }
+    );
     let files: Vec<String> = files
         .iter()
         .filter(|f| is_arch(&f.arch))
         .map(|f| format!("{}:{}:{}", f.arch, f.crc, f.size))
         .collect();
     if files.is_empty() {
-        return format!(
-            "sh -c 'p=$HOME/.local/bin/ferostream-agent; test -x \"$p\" || p=ferostream-agent; {start}'"
-        );
+        return format!("sh -c '{head}; test -x \"$p\" || {{ p=ferostream-agent; r=; }}; {start}'");
     }
-    // w = "crc:size" for this host; cksum prints "crc size".
     format!(
-        "sh -c 'p=$HOME/.local/bin/ferostream-agent; a=$(uname -m); w=; \
+        "sh -c '{head}; a=$(uname -m); w=; \
          for e in {list}; do case $e in \"$a\":*) w=${{e#*:}};; esac; done; \
          if [ -n \"$w\" ]; then \
          c=\"${{w%:*}} ${{w#*:}}\"; \
          if [ ! -x \"$p\" ] || [ \"$(cksum < \"$p\" 2>/dev/null)\" != \"$c\" ]; then \
          mkdir -p \"${{p%/*}}\" && printf \"\\000FEROSTREAM-UPLOAD %s\\n\" \"$a\" && \
          head -c \"${{w#*:}}\" > \"$p.new\" && [ \"$(cksum < \"$p.new\")\" = \"$c\" ] && \
-         chmod 755 \"$p.new\" && mv -f \"$p.new\" \"$p\" || \
+         chmod 700 \"$p.new\" && mv -f \"$p.new\" \"$p\" || \
          {{ echo \"ferostream: could not install the agent in ${{p%/*}}\" >&2; rm -f \"$p.new\"; exit 1; }}; \
          fi; \
-         else test -x \"$p\" || p=ferostream-agent; fi; \
+         else test -x \"$p\" || {{ p=ferostream-agent; r=; }}; fi; \
          {start}'",
         list = files.join(" ")
     )
 }
 
-/// The agent's arguments for `attach`.
 fn agent_args(attach: &AttachTo) -> Vec<&str> {
     match attach {
         AttachTo::New => vec!["--stdio"],
@@ -252,6 +322,8 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut agent = None;
     let mut attach = AttachTo::New;
     let mut install = true;
+    let mut install_to: Option<String> = None;
+    let mut remove = false;
     let mut clipboard = Clipboard {
         to_host: true,
         from_host: true,
@@ -277,6 +349,8 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--agent" => agent = Some(value(a)?),
             "--clipboard" => clipboard = Clipboard::parse(&value(a)?)?,
             "--no-install" => install = false,
+            "--install-to" => install_to = Some(value(a)?),
+            "--remove-agent" => remove = true,
             "--attach" => attach = AttachTo::Newest,
             s if s.starts_with("--attach=") => {
                 let id = s.trim_start_matches("--attach=");
@@ -301,7 +375,15 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     if program.is_empty() {
         program.push("xterm".into());
     }
+    let place = match install_to {
+        Some(p) => Place::new(&p, remove)?,
+        None => Place {
+            remove,
+            ..Place::default()
+        },
+    };
     Ok(Some(Options {
+        place,
         ssh: ssh.unwrap_or_else(default_ssh),
         ssh_args,
         destination,
@@ -348,10 +430,10 @@ pub fn ssh_command(o: &Options, files: &[AgentFile], attach: &AttachTo) -> Comma
             c.args(agent_args(attach));
         }
         None if o.install => {
-            c.arg(remote_command(files, attach));
+            c.arg(remote_command(files, attach, &o.place));
         }
         None => {
-            c.arg(remote_command(&[], attach));
+            c.arg(remote_command(&[], attach, &o.place));
         }
     };
     c
@@ -458,6 +540,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_places() {
+        assert_eq!(
+            Place::new("~/bin/fa", false).unwrap().sh_path,
+            "$HOME/bin/fa"
+        );
+        assert_eq!(Place::new("/opt/x/fa", true).unwrap().sh_path, "/opt/x/fa");
+        for bad in [
+            "bin/fa", "~/", "/", "~/a b", "~/a;rm", "~/x/../y", "~/x//y", "~/x/", "~/$(id)",
+            "~/'q", "~/a\"b",
+        ] {
+            assert!(Place::new(bad, false).is_err(), "{bad}");
+        }
+        let o = parse_args(&args("--install-to ~/t/fa --remove-agent box"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.place, Place::new("~/t/fa", true).unwrap());
+        assert!(parse_args(&args("--install-to rel/fa box")).is_err());
+    }
+
+    #[test]
     fn clipboard_ways() {
         let both = parse_args(&args("box")).unwrap().unwrap().clipboard;
         assert!(both.to_host && both.from_host);
@@ -491,7 +593,10 @@ mod tests {
             ]
         );
         assert_eq!(a[10], "box");
-        assert_eq!(a[11], remote_command(&[], &AttachTo::New));
+        assert_eq!(
+            a[11],
+            remote_command(&[], &AttachTo::New, &Place::default())
+        );
         assert!(!a[11].contains("UPLOAD"));
 
         // An agent path: used as given, never installed.
@@ -515,7 +620,7 @@ mod tests {
         let o = parse_args(&args("--no-install box")).unwrap().unwrap();
         let a = command_args(&ssh_command(&o, &[file], &AttachTo::Newest));
         assert!(!a.last().unwrap().contains("UPLOAD"));
-        assert!(a.last().unwrap().ends_with("--stdio --attach'"));
+        assert!(a.last().unwrap().ends_with("--stdio --attach $r'"));
     }
 
     /// Runs the remote command in a local `sh` with `home` as `$HOME`,
@@ -597,6 +702,7 @@ mod tests {
                 file(&v1),
             ],
             &AttachTo::New,
+            &Place::default(),
         );
         let (ok, out) = run_remote(&cmd, &home, &v1);
         assert!(ok);
@@ -615,7 +721,11 @@ mod tests {
 
         // Different: replaced.
         let v2 = agent("two");
-        let cmd = remote_command(&[file(&v2)], &AttachTo::Id("0123456789ab".into()));
+        let cmd = remote_command(
+            &[file(&v2)],
+            &AttachTo::Id("0123456789ab".into()),
+            &Place::default(),
+        );
         let (ok, out) = run_remote(&cmd, &home, &v2);
         assert!(ok);
         assert!(
@@ -624,7 +734,7 @@ mod tests {
 
         // A transfer that breaks off: the old agent stays, nothing starts.
         let v3 = agent("three");
-        let cmd = remote_command(&[file(&v3)], &AttachTo::New);
+        let cmd = remote_command(&[file(&v3)], &AttachTo::New, &Place::default());
         let (ok, out) = run_remote(&cmd, &home, &v3[..5]);
         assert!(!ok);
         assert!(!String::from_utf8_lossy(&out).contains("agent-"));
@@ -638,10 +748,32 @@ mod tests {
                 ..file(&v3)
             }],
             &AttachTo::Newest,
+            &Place::default(),
         );
         let (ok, out) = run_remote(&cmd, &home, b"");
         assert!(ok);
         assert_eq!(out, b"agent-two --stdio --attach\n");
+
+        // Another place, removed when done: the flag goes to that agent.
+        let place = Place::new("~/apps/fs/ferostream-agent", true).unwrap();
+        let cmd = remote_command(&[file(&v1)], &AttachTo::New, &place);
+        let (ok, out) = run_remote(&cmd, &home, &v1);
+        assert!(ok);
+        assert!(
+            String::from_utf8_lossy(&out).ends_with("agent-one --stdio --remove-when-done\n"),
+            "{out:?}"
+        );
+        let other = home.join("apps/fs/ferostream-agent");
+        assert_eq!(std::fs::read(&other).unwrap(), v1);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&other).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        // Not there and no copy: the one on PATH runs, never with the flag.
+        let place = Place::new("~/nowhere/ferostream-agent", true).unwrap();
+        let cmd = remote_command(&[], &AttachTo::New, &place);
+        assert!(cmd.contains("p=ferostream-agent; r=;"));
         std::fs::remove_dir_all(&home).unwrap();
     }
 }

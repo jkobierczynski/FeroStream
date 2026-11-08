@@ -13,6 +13,12 @@ ferostream-proto.workspace = true
 [target.'cfg(unix)'.dependencies]
 x11rb = { version = "0.14", default-features = false, features = ["composite", "damage", "randr", "xfixes", "xtest"] }
 getrandom = "0.4"
+rustix = { version = "1", default-features = false, features = ["std", "process", "thread"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+libc = "0.2"
+seccompiler = "0.5"
 
 [lints]
 workspace = true

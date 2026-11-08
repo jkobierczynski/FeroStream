@@ -6,6 +6,8 @@
 mod agent;
 #[cfg(unix)]
 mod clipboard;
+#[cfg(target_os = "linux")]
+mod harden;
 #[cfg(unix)]
 mod keyboard;
 #[cfg(unix)]
