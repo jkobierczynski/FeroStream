@@ -12,7 +12,7 @@
 )]
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
@@ -994,4 +994,72 @@ fn stop_and_check(runtime: &Runtime, id: &str) {
     assert!(status.success());
     assert!(!runtime.session_dir(id).exists());
     assert!(!session_list(runtime).contains(id));
+}
+
+/// `--remove-when-done`: a copied agent deletes its own file once its
+/// session ends, but not while another session still runs.
+#[test]
+fn copied_agent_removes_itself_when_done() {
+    if !need_x() {
+        return;
+    }
+    let runtime = Runtime::new();
+    let bin = runtime.0.with_extension("bin");
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let copy = bin.join("ferostream-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_ferostream-agent"), &copy).unwrap();
+
+    // Another session runs (started by the usual agent): the copy stays.
+    let other = Agent::start(&["xterm", "-geometry", "20x5"]);
+    let other_id = other.until(|m| match m {
+        Message::Session { id, .. } => Some(id),
+        _ => None,
+    });
+    let other_runtime = Arc::clone(&other.runtime);
+
+    let run_copy = |runtime: &Path| {
+        let mut child = Command::new(&copy)
+            .args(["--stdio", "--remove-when-done"])
+            .env("FEROSTREAM_RUNTIME_DIR", runtime)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        for m in [
+            Message::Hello {
+                version: VERSION,
+                software: "test".into(),
+            },
+            Message::Start {
+                width: 640,
+                height: 480,
+                dpi: 96,
+                argv: vec!["true".into()],
+            },
+        ] {
+            stdin.write_all(&m.encode()).unwrap();
+        }
+        stdin.flush().unwrap();
+        let mut out = Vec::new();
+        child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+        drop(stdin);
+        let _ = child.wait();
+        out
+    };
+
+    // Same runtime as the other session: it still runs, the file stays.
+    let out = run_copy(&other_runtime.0);
+    assert!(!out.is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(copy.exists(), "removed while another session runs");
+
+    // Its own runtime, no other session: the file goes.
+    run_copy(&runtime.0);
+    wait_for("the copied agent to remove itself", || !copy.exists());
+
+    stop_and_check(&other_runtime, &other_id);
+    drop(other);
+    let _ = std::fs::remove_dir_all(&bin);
 }

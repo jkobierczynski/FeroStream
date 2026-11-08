@@ -1,13 +1,20 @@
 //! The Win32 side: one native window per remote window.
 //!
-//! All windows live on the UI thread. The transport's reader thread queues
-//! what arrives and posts `WM_APP` to a message-only window; the UI thread
-//! takes it from there. Pixels are kept per window ([`Framebuffer`]) and
-//! painted with `StretchDIBits` at 1:1 (the process is per-monitor DPI aware,
-//! so a remote pixel is a screen pixel).
+//! All windows live on the UI thread. A session's transport delivers what
+//! arrives through [`Events`], which queues it and posts `WM_APP` to a
+//! message-only window; the UI thread takes it from there. Pixels are kept
+//! per window ([`Framebuffer`]) and painted with `StretchDIBits` at 1:1 (the
+//! process should be per-monitor DPI aware, so a remote pixel is a screen
+//! pixel).
+//!
+//! The standalone client ([`run`]) has one session and its own message
+//! loop. A program that embeds the client (FeroSSH) calls [`start`] for
+//! each session, on its UI thread, and its own message loop drives the
+//! windows; a [`Host`] gives each session its transport and hears when it
+//! ends.
 //!
 //! Re-entrancy: Win32 calls such as `SetWindowPos` send messages straight
-//! back into the window procedure. The app state is borrowed with
+//! back into the window procedure. The sessions' state is borrowed with
 //! `try_borrow_mut`; a message that arrives while it is borrowed (one our
 //! own call caused) gets default handling. That is also what stops a move
 //! we make on the agent's behalf from being echoed back to it.
@@ -21,6 +28,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
+use ferostream_proto::tile::Encoding;
 use ferostream_proto::{Message, VERSION, WindowKind, WindowState};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -48,23 +56,101 @@ use crate::reconnect;
 use crate::transport::{AgentFile, AttachTo, Clipboard, Options, find_agent_files, ssh_command};
 
 const WM_LINK: u32 = WM_APP + 1;
-/// Timer on the message-only window: time to try reconnecting.
-const RECONNECT_TIMER: usize = 1;
+/// The window class of remote windows.
 const CLASS: PCWSTR = w!("FeroStreamWindow");
 const MSG_CLASS: PCWSTR = w!("FeroStreamLink");
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SOFTWARE: &str = concat!("ferostream ", env!("CARGO_PKG_VERSION"));
 
-/// What the reader thread has delivered and the UI thread not yet handled,
-/// with the number of the link it came from.
-static QUEUE: Mutex<VecDeque<(u32, Event)>> = Mutex::new(VecDeque::new());
-/// Number of the current link; events from links before it are dropped.
-static LINK_NUMBER: AtomicU32 = AtomicU32::new(0);
-/// The message-only window `WM_LINK` goes to.
+/// What transports have delivered and the UI thread not yet handled: the
+/// session, the link number it came from, the event.
+static QUEUE: Mutex<VecDeque<(u32, u32, Event)>> = Mutex::new(VecDeque::new());
+/// Numbers for sessions (from 1) and for links (each connect gets one;
+/// events from a session's earlier links are dropped).
+static NEXT_SESSION: AtomicU32 = AtomicU32::new(0);
+static NEXT_LINK: AtomicU32 = AtomicU32::new(0);
+/// The message-only window `WM_LINK` and the reconnect timers go to.
 static LINK_HWND: AtomicIsize = AtomicIsize::new(0);
 
 thread_local! {
-    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    static APPS: RefCell<HashMap<u32, App>> = RefCell::new(HashMap::new());
+}
+
+/// Where a session's messages for the agent go.
+pub trait Transport: std::fmt::Debug {
+    fn send(&self, m: Message);
+}
+
+impl Transport for Link {
+    fn send(&self, m: Message) {
+        Link::send(self, m);
+    }
+}
+
+/// Hands one transport's events to its session, from any thread.
+#[derive(Debug, Clone)]
+pub struct Events {
+    session: u32,
+    link: u32,
+}
+
+impl Events {
+    pub fn send(&self, event: Event) {
+        let mut q = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+        let was_empty = q.is_empty();
+        q.push_back((self.session, self.link, event));
+        drop(q);
+        if was_empty {
+            let hwnd = HWND(LINK_HWND.load(Ordering::SeqCst) as *mut _);
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_LINK, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    /// The session these events are for.
+    pub fn session(&self) -> u32 {
+        self.session
+    }
+}
+
+/// The program a session runs in: it connects the session to the agent and
+/// hears when the session is over.
+pub trait Host: std::fmt::Debug {
+    /// Starts a transport to the agent (`ferostream-agent --stdio` with
+    /// the arguments for `attach`). Everything it receives goes to
+    /// `events`; an [`Event::Closed`] when it ends.
+    fn connect(&mut self, attach: &AttachTo, events: Events) -> Result<Box<dyn Transport>, String>;
+    /// The session ended; its windows are gone. Called on the UI thread,
+    /// outside any of the session's own state.
+    fn ended(&mut self, end: End);
+}
+
+/// How a session ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct End {
+    pub session: u32,
+    /// The program's exit code (1 when the session failed).
+    pub exit_code: i32,
+    /// What went wrong, for the user.
+    pub problem: Option<String>,
+    /// The user closed the windows while the connection was down: the
+    /// program still runs on the host as this session id.
+    pub left_running: Option<String>,
+}
+
+/// What a session runs and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settings {
+    /// The program and its arguments (ignored when attaching).
+    pub program: Vec<String>,
+    pub clipboard: Clipboard,
+    pub attach: AttachTo,
+    /// Accept only raw tiles: the transport's bytes went through a
+    /// [`crate::decode::Decoder`] elsewhere (a sandboxed process) that
+    /// unpacked them, so a compressed tile here means that process is not
+    /// doing its job, and the session ends.
+    pub raw_only: bool,
 }
 
 #[derive(Debug)]
@@ -109,12 +195,16 @@ impl Remote {
     }
 }
 
+/// One session: a program on a host and its windows here.
 #[derive(Debug)]
 struct App {
-    link: Link,
-    options: Options,
-    /// Agents the client can copy to the host.
-    files: Vec<AgentFile>,
+    /// This session's number.
+    id: u32,
+    link: Box<dyn Transport>,
+    /// The link number events must carry.
+    link_number: u32,
+    host: Box<dyn Host>,
+    settings: Settings,
     /// The session on the host, once it has said its id.
     session: Option<String>,
     /// The connection is down: reconnect attempts made so far.
@@ -152,6 +242,8 @@ struct App {
     /// gets WM_ACTIVATEAPP; this makes the agent hear it once.
     app_active: bool,
     ended: bool,
+    /// The session is over (set where it cannot end at once).
+    done: bool,
     exit_code: i32,
     problem: Option<String>,
 }
@@ -172,15 +264,12 @@ pub fn message_box(title: &str, text: &str, error: bool) {
     }
 }
 
-/// Connects, shows the remote program's windows until it ends, and returns
-/// its exit code.
-pub fn run(options: Options) -> ExitCode {
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+/// Registers the window classes and makes the message-only window, once.
+fn init() -> Result<(), String> {
+    if LINK_HWND.load(Ordering::SeqCst) != 0 {
+        return Ok(());
     }
-    let Ok(module) = (unsafe { GetModuleHandleW(None) }) else {
-        return ExitCode::FAILURE;
-    };
+    let module = unsafe { GetModuleHandleW(None) }.map_err(|e| e.to_string())?;
     let instance = module.into();
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
     let class = WNDCLASSEXW {
@@ -202,7 +291,7 @@ pub fn run(options: Options) -> ExitCode {
         RegisterClassExW(&class);
         RegisterClassExW(&msg_class);
     }
-    let link_hwnd = match unsafe {
+    let link_hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             MSG_CLASS,
@@ -217,40 +306,28 @@ pub fn run(options: Options) -> ExitCode {
             Some(instance),
             None,
         )
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            message_box(
-                "FeroStream",
-                &format!("Could not create a window: {e}"),
-                true,
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    }
+    .map_err(|e| format!("Could not create a window: {e}"))?;
     LINK_HWND.store(link_hwnd.0 as isize, Ordering::SeqCst);
+    Ok(())
+}
 
-    // The agent for the host ships next to this exe.
-    let files = if options.install && options.agent.is_none() {
-        std::env::current_exe()
-            .ok()
-            .and_then(|me| me.parent().map(find_agent_files))
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let link = match start_link(&options, &files, &options.attach) {
-        Ok(l) => l,
-        Err(e) => {
-            message_box(
-                "FeroStream",
-                &format!("Could not start {}: {e}", options.ssh.display()),
-                true,
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
+/// Starts a session on the calling (UI) thread: `host` connects it, and
+/// its windows appear as the agent announces them. Returns the session's
+/// number. The thread needs a message loop that dispatches to all its
+/// windows (and should leave key messages for [`is_remote_window`]
+/// windows to them, untranslated by accelerators).
+pub fn start(settings: Settings, mut host: Box<dyn Host>) -> Result<u32, String> {
+    init()?;
+    let id = NEXT_SESSION.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let link_number = next_link();
+    let link = host.connect(
+        &settings.attach,
+        Events {
+            session: id,
+            link: link_number,
+        },
+    )?;
     let (ox, oy) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -260,38 +337,141 @@ pub fn run(options: Options) -> ExitCode {
     // Hello, Start and the screens go once the agent has answered: before
     // that, the host may still be taking the agent binary.
     let screens = monitors((ox, oy));
-    let clipboard = options.clipboard;
-
+    let clipboard = settings.clipboard;
     let grey = unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0080_8080)) };
-    APP.with(|a| {
-        *a.borrow_mut() = Some(App {
-            link,
-            options,
-            files,
-            session: None,
-            away: None,
-            left_running: false,
-            windows: HashMap::new(),
-            by_hwnd: HashMap::new(),
-            origin: (ox, oy),
-            grey,
-            wheel: 0,
-            hwheel: 0,
-            held: Vec::new(),
-            chords: HashMap::new(),
-            altgr: false,
-            high_surrogate: None,
-            cursor: None,
-            clipboard,
-            clip_seq: 0,
-            last_clip: None,
-            monitors: screens,
-            app_active: false,
-            ended: false,
-            exit_code: 0,
-            problem: None,
-        });
-    });
+    let app = App {
+        id,
+        link,
+        link_number,
+        host,
+        settings,
+        session: None,
+        away: None,
+        left_running: false,
+        windows: HashMap::new(),
+        by_hwnd: HashMap::new(),
+        origin: (ox, oy),
+        grey,
+        wheel: 0,
+        hwheel: 0,
+        held: Vec::new(),
+        chords: HashMap::new(),
+        altgr: false,
+        high_surrogate: None,
+        cursor: None,
+        clipboard,
+        clip_seq: 0,
+        last_clip: None,
+        monitors: screens,
+        app_active: false,
+        ended: false,
+        done: false,
+        exit_code: 0,
+        problem: None,
+    };
+    APPS.with(|a| {
+        a.try_borrow_mut()
+            .map(|mut a| {
+                a.insert(id, app);
+            })
+            .map_err(|_| "FeroStream is busy; try again.".to_string())
+    })?;
+    Ok(id)
+}
+
+/// Ends session `session` from the host's side: its windows close and its
+/// transport is dropped. The program goes on running on the host (it can
+/// be attached again). [`Host::ended`] is not called.
+pub fn stop(session: u32) {
+    let app = APPS.with(|a| a.try_borrow_mut().ok()?.remove(&session));
+    if let Some(app) = app {
+        app.close_windows();
+    }
+}
+
+/// The sessions running on this thread.
+pub fn sessions() -> Vec<u32> {
+    APPS.with(|a| {
+        a.try_borrow()
+            .map(|a| a.keys().copied().collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether `hwnd` is one of the remote windows: an embedding program sends
+/// its key messages straight to it (no accelerators, no dialog keys).
+pub fn is_remote_window(hwnd: HWND) -> bool {
+    let mut name = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut name) };
+    let want = b"FeroStreamWindow".map(u16::from);
+    usize::try_from(n).is_ok_and(|n| name.get(..n) == Some(&want[..]))
+}
+
+fn next_link() -> u32 {
+    NEXT_LINK.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+}
+
+/// The standalone client's host: `ssh.exe` starts the agent.
+#[derive(Debug)]
+struct SshHost {
+    options: Options,
+    /// Agents the client can copy to the host.
+    files: Vec<AgentFile>,
+}
+
+thread_local! {
+    /// How the standalone client's session ended.
+    static OUTCOME: RefCell<Option<End>> = const { RefCell::new(None) };
+}
+
+impl Host for SshHost {
+    fn connect(&mut self, attach: &AttachTo, events: Events) -> Result<Box<dyn Transport>, String> {
+        let mut cmd = ssh_command(&self.options, &self.files, attach);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        // ssh has no console to ask for a password or a host-key answer in,
+        // so it asks us: this exe in askpass mode shows a small dialog.
+        if let Ok(me) = std::env::current_exe() {
+            cmd.env("SSH_ASKPASS", me)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env(crate::askpass::ENV, "1");
+        }
+        Link::start(cmd, self.files.clone(), move |event| events.send(event))
+            .map(|l| Box::new(l) as Box<dyn Transport>)
+            .map_err(|e| format!("Could not start {}: {e}", self.options.ssh.display()))
+    }
+
+    fn ended(&mut self, end: End) {
+        OUTCOME.with(|o| *o.borrow_mut() = Some(end));
+        unsafe { PostQuitMessage(0) };
+    }
+}
+
+/// Connects, shows the remote program's windows until it ends, and returns
+/// its exit code.
+pub fn run(options: Options) -> ExitCode {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    // The agent for the host ships next to this exe.
+    let files = if options.install && options.agent.is_none() {
+        std::env::current_exe()
+            .ok()
+            .and_then(|me| me.parent().map(find_agent_files))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let settings = Settings {
+        program: options.program.clone(),
+        clipboard: options.clipboard,
+        attach: options.attach.clone(),
+        raw_only: false,
+    };
+    let destination = options.destination.clone();
+    if let Err(e) = start(settings, Box::new(SshHost { options, files })) {
+        message_box("FeroStream", &e, true);
+        return ExitCode::FAILURE;
+    }
 
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -301,83 +481,85 @@ pub fn run(options: Options) -> ExitCode {
         }
     }
 
-    let (code, problem, note) = APP.with(|a| {
-        let app = a.borrow_mut().take();
-        app.map(|app| {
-            let note = app
-                .session
-                .as_deref()
-                .filter(|_| app.left_running)
-                .map(|id| reconnect::left_running(&app.options.destination, id));
-            (app.exit_code, app.problem, note)
-        })
-        .unwrap_or((1, None, None))
-    });
-    if let Some(p) = problem {
+    let Some(end) = OUTCOME.with(|o| o.borrow_mut().take()) else {
+        return ExitCode::FAILURE;
+    };
+    if let Some(p) = end.problem {
         message_box("FeroStream", &p, true);
-    } else if let Some(n) = note {
-        message_box("FeroStream", &n, false);
+    } else if let Some(id) = end.left_running {
+        message_box(
+            "FeroStream",
+            &reconnect::left_running(&destination, &id),
+            false,
+        );
     }
-    ExitCode::from(code.clamp(0, 255) as u8)
+    ExitCode::from(end.exit_code.clamp(0, 255) as u8)
 }
 
-/// Starts ssh and the agent for session `attach`. Its events go to the UI
-/// thread tagged with a new link number; older links' events are dropped.
-fn start_link(options: &Options, files: &[AgentFile], attach: &AttachTo) -> std::io::Result<Link> {
-    let mut cmd = ssh_command(options, files, attach);
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    // ssh has no console to ask for a password or a host-key answer in, so
-    // it asks us: this exe in askpass mode shows a small dialog.
-    if let Ok(me) = std::env::current_exe() {
-        cmd.env("SSH_ASKPASS", me)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env(crate::askpass::ENV, "1");
-    }
-    let number = LINK_NUMBER.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
-    Link::start(cmd, files.to_vec(), move |event| {
-        let mut q = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
-        let was_empty = q.is_empty();
-        q.push_back((number, event));
-        drop(q);
-        if was_empty {
-            let hwnd = HWND(LINK_HWND.load(Ordering::SeqCst) as *mut _);
-            unsafe {
-                let _ = PostMessageW(Some(hwnd), WM_LINK, WPARAM(0), LPARAM(0));
-            }
-        }
-    })
-}
-
-/// Runs `f` on the app state, or returns `None` when it is already borrowed
-/// (a message our own Win32 call sent).
-fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
-    APP.with(|a| {
+/// Runs `f` on session `session`'s state, or returns `None` when the state
+/// is already borrowed (a message our own Win32 call sent) or the session
+/// is gone.
+fn with_app<R>(session: u32, f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APPS.with(|a| {
         let mut b = a.try_borrow_mut().ok()?;
-        b.as_mut().map(f)
+        b.get_mut(&session).map(f)
     })
+}
+
+/// Ends session `session` if it is done: its windows go and its host
+/// hears how it ended.
+fn finish_if_done(session: u32) {
+    let app = APPS.with(|a| {
+        let mut a = a.try_borrow_mut().ok()?;
+        if a.get(&session).is_some_and(|app| app.done) {
+            a.remove(&session)
+        } else {
+            None
+        }
+    });
+    let Some(mut app) = app else { return };
+    let end = End {
+        session,
+        exit_code: app.exit_code,
+        problem: app.problem.take(),
+        left_running: app.session.clone().filter(|_| app.left_running),
+    };
+    let link_hwnd = HWND(LINK_HWND.load(Ordering::SeqCst) as *mut _);
+    unsafe {
+        let _ = KillTimer(Some(link_hwnd), session as usize);
+    }
+    let mut host = app.close_windows();
+    host.ended(end);
 }
 
 extern "system" fn link_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_LINK {
         loop {
             let next = QUEUE.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
-            let Some((number, event)) = next else { break };
-            if number != LINK_NUMBER.load(Ordering::SeqCst) {
-                continue;
-            }
-            let quit = with_app(|app| app.on_event(event)).unwrap_or(false);
-            if quit {
-                unsafe { PostQuitMessage(0) };
+            let Some((session, number, event)) = next else {
                 break;
+            };
+            let over = with_app(session, |app| {
+                if app.link_number != number {
+                    return false;
+                }
+                if app.on_event(event) {
+                    app.done = true;
+                }
+                app.done
+            });
+            if over == Some(true) {
+                finish_if_done(session);
             }
         }
         return LRESULT(0);
     }
-    if msg == WM_TIMER && wparam.0 == RECONNECT_TIMER {
+    if msg == WM_TIMER {
+        let session = wparam.0 as u32;
         unsafe {
-            let _ = KillTimer(Some(hwnd), RECONNECT_TIMER);
+            let _ = KillTimer(Some(hwnd), wparam.0);
         }
-        with_app(App::reconnect);
+        with_app(session, App::reconnect);
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -408,7 +590,7 @@ impl App {
         let ms = reconnect::delay(attempt).as_millis() as u32;
         let hwnd = HWND(LINK_HWND.load(Ordering::SeqCst) as *mut _);
         unsafe {
-            SetTimer(Some(hwnd), RECONNECT_TIMER, ms, None);
+            SetTimer(Some(hwnd), self.id as usize, ms, None);
         }
     }
 
@@ -417,10 +599,35 @@ impl App {
         let Some(id) = self.session.clone() else {
             return;
         };
-        match start_link(&self.options, &self.files, &AttachTo::Id(id)) {
-            Ok(link) => self.link = link,
+        let number = next_link();
+        let events = Events {
+            session: self.id,
+            link: number,
+        };
+        match self.host.connect(&AttachTo::Id(id), events) {
+            Ok(link) => {
+                self.link = link;
+                self.link_number = number;
+            }
             Err(_) => self.lost(),
         }
+    }
+
+    /// Closes every window and gives back the host.
+    fn close_windows(mut self) -> Box<dyn Host> {
+        let ids: Vec<u32> = self.windows.keys().copied().collect();
+        for id in ids {
+            self.destroy(id);
+        }
+        if let Some(c) = self.cursor.take() {
+            unsafe {
+                let _ = DestroyCursor(c);
+            }
+        }
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(self.grey.into());
+        }
+        self.host
     }
 
     /// The agent answered: say who we are and what we want.
@@ -429,7 +636,7 @@ impl App {
             version: VERSION,
             software: SOFTWARE.into(),
         });
-        if self.session.is_some() || self.options.attach != AttachTo::New {
+        if self.session.is_some() || self.settings.attach != AttachTo::New {
             self.link.send(Message::Attach);
         } else {
             let (vw, vh) = unsafe {
@@ -445,7 +652,7 @@ impl App {
                 // The primary screen's scaling; the remote display has one DPI.
                 dpi: (unsafe { GetDpiForSystem() } as u16)
                     .clamp(ferostream_proto::MIN_DPI, ferostream_proto::MAX_DPI),
-                argv: self.options.program.clone(),
+                argv: self.settings.program.clone(),
             });
         }
         if !self.monitors.is_empty() {
@@ -560,6 +767,13 @@ impl App {
                 }
             }
             Message::WindowGone { window } => self.destroy(window),
+            Message::Tile(t) if self.settings.raw_only && t.encoding != Encoding::Raw => {
+                self.ended = true;
+                self.exit_code = 1;
+                self.problem =
+                    Some("The decoder sent a packed tile; the session was ended.".into());
+                return true;
+            }
             Message::Tile(t) => {
                 if let Some(r) = self.windows.get_mut(&t.window) {
                     r.pending.push(t);
@@ -752,6 +966,9 @@ impl App {
             },
         );
         self.by_hwnd.insert(hwnd.0 as isize, window);
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, self.id as isize);
+        }
         // Size the frame so the client area is exactly the remote window.
         let (cx, cy) = if at_default {
             client_origin(hwnd)
@@ -1062,12 +1279,18 @@ fn down(vk: i32) -> bool {
 }
 
 extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let handled = with_app(|app| {
+    // The session the window belongs to (0 before it is set).
+    let session = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as u32;
+    let handled = with_app(session, |app| {
         let id = *app.by_hwnd.get(&(hwnd.0 as isize))?;
-        on_window(app, id, hwnd, msg, wparam, lparam)
+        let r = on_window(app, id, hwnd, msg, wparam, lparam);
+        Some((r, app.done))
     })
     .flatten();
-    match handled {
+    if let Some((_, true)) = handled {
+        finish_if_done(session);
+    }
+    match handled.and_then(|(r, _)| r) {
         Some(r) => r,
         None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
@@ -1404,7 +1627,7 @@ fn on_window(
                 app.destroy(id);
                 if !app.windows.values().any(|r| r.kind != WindowKind::Popup) {
                     app.left_running = true;
-                    unsafe { PostQuitMessage(0) };
+                    app.done = true;
                 }
                 return Some(LRESULT(0));
             }

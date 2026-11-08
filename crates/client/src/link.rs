@@ -11,8 +11,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use ferostream_proto::{FrameReader, Message, PREAMBLE};
+use ferostream_proto::{Message, PREAMBLE};
 
+use crate::decode::{Decoder, Output};
 use crate::transport::{AgentFile, UPLOAD_MARKER, is_arch};
 
 /// Most of ssh's error output kept for the user, in bytes (the end of it).
@@ -138,8 +139,8 @@ impl Link {
         let (tx, rx) = mpsc::channel::<Out>();
         let upload_tx = tx.clone();
         std::thread::spawn(move || {
-            let mut reader = FrameReader::after_preamble();
-            let mut scan = UploadScan::default();
+            let mut decoder = Decoder::new(false);
+            let mut out = Vec::new();
             let mut buf = vec![0u8; 256 * 1024];
             let error = 'read: loop {
                 let n = match stdout.read(&mut buf) {
@@ -148,33 +149,32 @@ impl Link {
                     Err(e) => break Some(e.to_string()),
                 };
                 let data = buf.get(..n).unwrap_or_default();
-                if let Some(arch) = scan.push(data) {
-                    // The remote command checks size and CRC again, so a
-                    // file that changed meanwhile is refused there.
-                    match files.iter().find(|f| f.arch == arch) {
-                        Some(f) => match std::fs::read(&f.path) {
-                            Ok(bytes) => {
-                                let _ = upload_tx.send(Out::Raw(bytes));
-                            }
-                            Err(e) => {
+                let result = decoder.push(data, &mut out);
+                for o in out.drain(..) {
+                    match o {
+                        Output::Upload(arch) => match files.iter().find(|f| f.arch == arch) {
+                            Some(f) => match std::fs::read(&f.path) {
+                                Ok(bytes) => {
+                                    let _ = upload_tx.send(Out::Raw(bytes));
+                                }
+                                Err(e) => {
+                                    break 'read Some(format!(
+                                        "could not read {}: {e}",
+                                        f.path.display()
+                                    ));
+                                }
+                            },
+                            None => {
                                 break 'read Some(format!(
-                                    "could not read {}: {e}",
-                                    f.path.display()
+                                    "the host asked for an agent for {arch}"
                                 ));
                             }
                         },
-                        None => {
-                            break 'read Some(format!("the host asked for an agent for {arch}"));
-                        }
+                        Output::Message(m) => notify(Event::Message(m)),
                     }
                 }
-                reader.push(data);
-                loop {
-                    match reader.next_message() {
-                        Ok(Some(m)) => notify(Event::Message(m)),
-                        Ok(None) => break,
-                        Err(e) => break 'read Some(e.to_string()),
-                    }
+                if let Err(e) = result {
+                    break Some(e);
                 }
             };
             let _ = err_thread.join();

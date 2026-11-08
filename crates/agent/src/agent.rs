@@ -28,7 +28,7 @@ use crate::xserver::XServer;
 
 const SOFTWARE: &str = concat!("ferostream-agent ", env!("CARGO_PKG_VERSION"));
 
-const USAGE: &str = "usage: ferostream-agent --stdio [--attach [ID]]
+const USAGE: &str = "usage: ferostream-agent --stdio [--attach [ID]] [--remove-when-done]
        ferostream-agent --list | --stop ID
 
 Speaks the FeroStream protocol on stdin and stdout. Start it through
@@ -38,7 +38,9 @@ ferostream.exe (or another FeroStream client), not by hand.
   --stdio --attach   take over the session whose client left last
   --stdio --attach ID  take over session ID
   --list             the sessions running for this user
-  --stop ID          end session ID (its program is stopped)";
+  --stop ID          end session ID (its program is stopped)
+  --remove-when-done delete this agent's file once its session ends and
+                     no other session of this user runs";
 
 /// How long the first client may take to connect to a new session.
 const FIRST_CLIENT_WAIT: Duration = Duration::from_secs(10);
@@ -47,11 +49,18 @@ const HANDSHAKE_WAIT: Duration = Duration::from_secs(30);
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let remove = args.iter().any(|a| a == "--remove-when-done");
+    let args: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != "--remove-when-done")
+        .collect();
     match args.as_slice() {
-        [] | ["--stdio"] => relay::run(&Target::New),
-        ["--stdio", "--attach"] => relay::run(&Target::Newest),
-        ["--stdio", "--attach", id] if is_session_id(id) => relay::run(&Target::Id((*id).into())),
+        [] | ["--stdio"] => relay::run(&Target::New, remove),
+        ["--stdio", "--attach"] => relay::run(&Target::Newest, remove),
+        ["--stdio", "--attach", id] if is_session_id(id) => {
+            relay::run(&Target::Id((*id).into()), remove)
+        }
         ["--serve", dir] => match serve(Path::new(dir)) {
             Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
             Err(e) => {
@@ -253,7 +262,11 @@ fn serve(dir: &Path) -> Result<i32, String> {
         .ok_or("not a session directory")?
         .to_string();
     let result = serve_in(dir, &id);
+    let remove = dir.join(runtime::REMOVE_MARK).exists();
     let _ = std::fs::remove_dir_all(dir);
+    if remove && let Some(base) = dir.parent() {
+        runtime::remove_agent_if_idle(base);
+    }
     result
 }
 

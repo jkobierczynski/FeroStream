@@ -29,10 +29,23 @@ pub enum Target {
 /// How long a new session may take to start listening.
 const START_WAIT: Duration = Duration::from_secs(10);
 
-pub fn run(target: &Target) -> ExitCode {
-    match connect(target).and_then(pass_through) {
+/// Serves the client on stdin and stdout. With `remove`, the agent's file
+/// goes when the session ends and no other session runs (the session
+/// directory carries the request: a session started without it may be
+/// attached with it).
+pub fn run(target: &Target, remove: bool) -> ExitCode {
+    let found = connect(target).map(|(sock, dir)| {
+        if remove {
+            let _ = fs::write(dir.join(runtime::REMOVE_MARK), b"");
+        }
+        sock
+    });
+    match found.and_then(pass_through) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            if remove && let Ok(base) = runtime::base() {
+                runtime::remove_agent_if_idle(&base);
+            }
             // In the protocol, so the client can show it.
             let mut out = std::io::stdout().lock();
             let _ = out.write_all(PREAMBLE);
@@ -44,7 +57,8 @@ pub fn run(target: &Target) -> ExitCode {
     }
 }
 
-fn connect(target: &Target) -> Result<UnixStream, String> {
+/// The session's socket and directory.
+fn connect(target: &Target) -> Result<(UnixStream, std::path::PathBuf), String> {
     let base = runtime::base()?;
     match target {
         Target::New => start(&base),
@@ -55,7 +69,9 @@ fn connect(target: &Target) -> Result<UnixStream, String> {
                     "there is no FeroStream session {id} on this host (any more)"
                 ));
             }
-            UnixStream::connect(base.join(id).join("sock"))
+            let dir = base.join(id);
+            UnixStream::connect(dir.join("sock"))
+                .map(|s| (s, dir))
                 .map_err(|e| format!("could not reach session {id}: {e}"))
         }
         Target::Newest => {
@@ -63,13 +79,14 @@ fn connect(target: &Target) -> Result<UnixStream, String> {
             let s = runtime::newest_detached(&sessions)
                 .ok_or("there is no FeroStream session on this host to attach to")?;
             UnixStream::connect(s.dir.join("sock"))
+                .map(|sock| (sock, s.dir.clone()))
                 .map_err(|e| format!("could not reach session {}: {e}", s.id))
         }
     }
 }
 
 /// Starts a session process, detached from SSH, and connects to it.
-fn start(base: &Path) -> Result<UnixStream, String> {
+fn start(base: &Path) -> Result<(UnixStream, std::path::PathBuf), String> {
     let id = runtime::new_id()?;
     let dir = runtime::create(base, &id)?;
     let log = fs::OpenOptions::new()
@@ -99,7 +116,7 @@ fn start(base: &Path) -> Result<UnixStream, String> {
     let deadline = Instant::now() + START_WAIT;
     loop {
         if let Ok(s) = UnixStream::connect(&sock) {
-            return Ok(s);
+            return Ok((s, dir));
         }
         if let Ok(Some(status)) = child.try_wait() {
             let log = fs::read_to_string(dir.join("log")).unwrap_or_default();

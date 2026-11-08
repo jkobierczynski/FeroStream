@@ -8,6 +8,7 @@
 #[cfg(windows)]
 pub mod clip;
 pub mod cliptext;
+pub mod decode;
 pub mod fb;
 pub mod keys;
 pub mod link;
