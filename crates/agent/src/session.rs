@@ -3,7 +3,9 @@
 //!
 //! Every top-level window is redirected off-screen (Composite), so each one
 //! keeps all its pixels even where others overlap it. Damage reports what
-//! changed; GetImage reads it back; the tiles go to the client LZ4-packed.
+//! changed; GetImage reads it back. The agent keeps a copy of what the
+//! client has ([`crate::shadow`]): only pixels that really changed are sent,
+//! scrolls go as copies, and tiles are packed as hard as the link calls for.
 //! There is no real window manager: windows sit where the client puts them.
 //! The agent does answer the questions programs ask one (EWMH): window
 //! types, maximise and full-screen requests, icons, size limits.
@@ -15,15 +17,15 @@
 //! are dropped and changes pile up as dirty rectangles; a new client gets
 //! every window announced again and its pixels in full ([`Session::attach`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ferostream_proto::image::{self, Image, MAX_IMAGE_SIDE};
-use ferostream_proto::tile::{MAX_TILE_SIDE, Tile};
-use ferostream_proto::{MAX_WINDOW_SIDE, Message, WindowKind, WindowState};
+use ferostream_proto::tile::{Effort, MAX_TILE_SIDE, Tile};
+use ferostream_proto::{MAX_WINDOW_SIDE, Message, Packing, WindowKind, WindowState};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::{self, ConnectionExt as _};
@@ -37,6 +39,7 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use crate::clipboard;
 use crate::keyboard::Keyboard;
+use crate::shadow::{self, Rect, Shadow};
 use crate::wm;
 
 /// Frames a window may have unacknowledged before the agent waits for the
@@ -57,12 +60,55 @@ const SETTLE_QUIET: Duration = Duration::from_millis(4);
 /// often.
 const SETTLE_MAX: Duration = Duration::from_millis(30);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Rect {
-    x: u16,
-    y: u16,
-    w: u16,
-    h: u16,
+/// Rows read from X in one GetImage, so one reply stays a few MB.
+const BAND_ROWS: u16 = 128;
+
+/// In [`Packing::Auto`], a link slower than this (bytes a second) gets
+/// Deflate...
+const SLOW_LINK: f64 = 3_000_000.0;
+/// ...and one faster than this LZ4. In between, the choice stays.
+const FAST_LINK: f64 = 8_000_000.0;
+
+/// Frames smaller than this say too little about the link's speed.
+const MIN_SAMPLE: usize = 16 * 1024;
+
+/// How fast the link is, from how long frames take to be acknowledged.
+#[derive(Debug)]
+struct Link {
+    /// Bytes a second, smoothed.
+    rate: Option<f64>,
+    /// Whether Auto packs with Deflate now. Until the link is measured it
+    /// does: the first frames are the biggest, and a slow link is where they
+    /// hurt.
+    slow: bool,
+}
+
+impl Default for Link {
+    fn default() -> Self {
+        Link {
+            rate: None,
+            slow: true,
+        }
+    }
+}
+
+impl Link {
+    fn sample(&mut self, bytes: usize, took: Duration) {
+        if bytes < MIN_SAMPLE {
+            return;
+        }
+        let r = bytes as f64 / took.as_secs_f64().max(0.000_1);
+        let rate = match self.rate {
+            Some(old) => old * 0.7 + r * 0.3,
+            None => r,
+        };
+        self.rate = Some(rate);
+        if rate < SLOW_LINK {
+            self.slow = true;
+        } else if rate > FAST_LINK {
+            self.slow = false;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -77,6 +123,10 @@ struct Win {
     dirty: Vec<Rect>,
     sent: u32,
     acked: u32,
+    /// What the client has on screen for this window.
+    shadow: Shadow,
+    /// Frames not acknowledged yet: sequence number, when, how many bytes.
+    in_flight: VecDeque<(u32, Instant, usize)>,
 }
 
 impl Win {
@@ -102,6 +152,20 @@ struct State {
     sent_clipboard: Option<String>,
     /// Monitors the agent set up on the display (RandR names).
     monitors: Vec<xproto::Atom>,
+    /// How hard the client wants tiles packed.
+    packing: Packing,
+    link: Link,
+}
+
+impl State {
+    fn effort(&self) -> Effort {
+        match self.packing {
+            Packing::Fast => Effort::Fast,
+            Packing::Strong => Effort::Strong,
+            Packing::Auto if self.link.slow => Effort::Strong,
+            Packing::Auto => Effort::Fast,
+        }
+    }
 }
 
 /// Where frames go: the attached client, or nowhere while the session is
@@ -380,10 +444,16 @@ impl Session {
         let windows: Vec<(u32, i16, i16, u16, u16, bool, WindowState)> = {
             let mut st = lock(&self.state);
             st.cursor = None;
+            // A new client, maybe over another link, with its own setting.
+            st.packing = Packing::Auto;
+            st.link = Link::default();
             for w in st.windows.values_mut() {
                 w.dirty = vec![w.full()];
                 w.sent = 0;
                 w.acked = 0;
+                // The client starts each window grey again.
+                w.shadow = Shadow::new(w.w, w.h);
+                w.in_flight.clear();
             }
             st.windows
                 .iter()
@@ -509,6 +579,8 @@ impl Session {
                     w.w = nw;
                     w.h = nh;
                     if resized {
+                        // The client resizes its picture the same way.
+                        w.shadow.resize(nw, nh);
                         w.dirty.clear();
                         let full = w.full();
                         w.dirty.push(full);
@@ -631,6 +703,8 @@ impl Session {
             dirty: vec![Rect { x: 0, y: 0, w, h }],
             sent: 0,
             acked: 0,
+            shadow: Shadow::new(w, h),
+            in_flight: VecDeque::new(),
         };
         lock(&self.state).windows.insert(window, win);
         let mut frames = vec![Message::WindowNew {
@@ -1052,34 +1126,104 @@ impl Session {
             // Re-arm damage reporting before reading, so a change made while
             // we read is reported again rather than lost.
             let _ = self.conn.damage_subtract(damage, x11rb::NONE, x11rb::NONE);
-            let mut cookies = Vec::new();
-            for r in rects.iter().flat_map(|r| split(*r)) {
-                let c = self
-                    .conn
-                    .get_image(
-                        xproto::ImageFormat::Z_PIXMAP,
-                        id,
-                        r.x as i16,
-                        r.y as i16,
-                        r.w,
-                        r.h,
-                        !0,
-                    )
-                    .map_err(err)?;
-                cookies.push((r, c));
-            }
-            let mut frames = Vec::with_capacity(cookies.len() + 1);
-            for (r, c) in cookies {
-                // A window that went away meanwhile answers with an error.
-                let Ok(img) = c.reply() else { continue };
-                let want = usize::from(r.w) * usize::from(r.h) * 4;
-                if img.data.len() != want {
-                    continue;
+            let mut asked = Vec::new();
+            for r in rects {
+                let mut bands = Vec::new();
+                let mut y = 0;
+                while y < r.h {
+                    let h = (r.h - y).min(BAND_ROWS);
+                    let c = self
+                        .conn
+                        .get_image(
+                            xproto::ImageFormat::Z_PIXMAP,
+                            id,
+                            r.x as i16,
+                            (r.y + y) as i16,
+                            r.w,
+                            h,
+                            !0,
+                        )
+                        .map_err(err)?;
+                    bands.push((usize::from(r.w) * usize::from(h) * 4, c));
+                    y += h;
                 }
-                frames.push(Message::Tile(Tile::lz4(id, r.x, r.y, r.w, r.h, &img.data)));
+                asked.push((r, bands));
+            }
+            let mut pictures = Vec::with_capacity(asked.len());
+            for (r, bands) in asked {
+                let mut px = Vec::with_capacity(usize::from(r.w) * usize::from(r.h) * 4);
+                let mut whole = true;
+                for (want, c) in bands {
+                    // A window that went away or shrank meanwhile answers
+                    // with an error or the wrong size.
+                    match c.reply() {
+                        Ok(img) if img.data.len() == want => px.extend_from_slice(&img.data),
+                        _ => whole = false,
+                    }
+                }
+                if whole {
+                    // The unused byte: 0, as every tile decodes it.
+                    for p in px.chunks_exact_mut(4) {
+                        if let Some(b) = p.get_mut(3) {
+                            *b = 0;
+                        }
+                    }
+                    pictures.push((r, px));
+                }
+            }
+            // Compare, pack and send with `out` held: an attach in between
+            // would give the new client copies of pixels it never had.
+            let mut out = lock(&self.out);
+            let (mut shadow, effort) = {
+                let mut st = lock(&self.state);
+                let effort = st.effort();
+                let Some(w) = st.windows.get_mut(&id) else {
+                    continue;
+                };
+                (std::mem::take(&mut w.shadow), effort)
+            };
+            let mut frames = Vec::new();
+            let mut bytes = 0;
+            for (r, px) in pictures {
+                if let Some(sc) = shadow.find_scroll(r, &px) {
+                    frames.push(Message::TileCopy {
+                        window: id,
+                        x: sc.x,
+                        y: sc.from_y,
+                        width: sc.w,
+                        height: sc.rows,
+                        to_x: sc.x,
+                        to_y: sc.to_y,
+                    });
+                    bytes += 17;
+                    shadow.copy(sc);
+                }
+                for c in shadow.changed(r, &px) {
+                    for t in split(c) {
+                        let sub = shadow::crop(&px, r, t);
+                        let tile = Tile::pack(id, t.x, t.y, t.w, t.h, &sub, effort);
+                        bytes += tile.data.len() + 18;
+                        shadow.store(t, &sub);
+                        frames.push(Message::Tile(tile));
+                    }
+                }
             }
             frames.push(Message::FrameEnd { window: id, seq });
-            self.send(&frames)?;
+            {
+                let mut st = lock(&self.state);
+                if let Some(w) = st.windows.get_mut(&id) {
+                    w.shadow = shadow;
+                    w.in_flight.push_back((seq, Instant::now(), bytes));
+                    while w.in_flight.len() > MAX_IN_FLIGHT as usize + 1 {
+                        w.in_flight.pop_front();
+                    }
+                }
+            }
+            if let Some(sink) = out.sink.as_mut()
+                && sink.send(&frames).is_err()
+            {
+                out.sink = None;
+            }
         }
         Ok(())
     }
@@ -1126,11 +1270,25 @@ impl Session {
                     if w.sent.wrapping_sub(seq) < MAX_IN_FLIGHT + 1 {
                         w.acked = seq;
                     }
-                    if !w.dirty.is_empty() {
+                    let mut done = None;
+                    while let Some(&(s, at, bytes)) = w.in_flight.front()
+                        && seq.wrapping_sub(s) <= MAX_IN_FLIGHT
+                    {
+                        w.in_flight.pop_front();
+                        done = Some((at, bytes));
+                    }
+                    let dirty = !w.dirty.is_empty();
+                    if let Some((at, bytes)) = done {
+                        st.link.sample(bytes, at.elapsed());
+                    }
+                    if dirty {
                         drop(st);
                         self.wake();
                     }
                 }
+            }
+            Message::Packing { mode } => {
+                lock(&self.state).packing = mode;
             }
             Message::Focus { window } => {
                 let normal = lock(&self.state)

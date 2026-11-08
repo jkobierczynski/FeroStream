@@ -146,6 +146,8 @@ pub struct Settings {
     pub program: Vec<String>,
     pub clipboard: Clipboard,
     pub attach: AttachTo,
+    /// How hard the agent packs pixels (sent to it at every connect).
+    pub packing: ferostream_proto::Packing,
     /// Accept only raw tiles: the transport's bytes went through a
     /// [`crate::decode::Decoder`] elsewhere (a sandboxed process) that
     /// unpacked them, so a compressed tile here means that process is not
@@ -160,9 +162,9 @@ struct Remote {
     kind: WindowKind,
     /// Last pointer position in this window, for wheel clicks.
     pointer: (i32, i32),
-    /// Tiles of the frame still arriving: drawn together at FrameEnd, so a
-    /// half-received frame is never on screen.
-    pending: Vec<ferostream_proto::tile::Tile>,
+    /// Tiles and copies of the frame still arriving, in order: drawn
+    /// together at FrameEnd, so a half-received frame is never on screen.
+    pending: Vec<Message>,
     /// Smallest and biggest client size the program allows; 0 is no limit.
     min: (u16, u16),
     max: (u16, u16),
@@ -179,8 +181,21 @@ struct Remote {
 impl Remote {
     /// Draws the tiles received so far.
     fn apply_pending(&mut self) {
-        for t in std::mem::take(&mut self.pending) {
-            if let Some(c) = self.fb.apply(&t) {
+        for m in std::mem::take(&mut self.pending) {
+            let changed = match m {
+                Message::Tile(t) => self.fb.apply(&t),
+                Message::TileCopy {
+                    x,
+                    y,
+                    width,
+                    height,
+                    to_x,
+                    to_y,
+                    ..
+                } => self.fb.copy(x, y, width, height, to_x, to_y),
+                _ => None,
+            };
+            if let Some(c) = changed {
                 let rect = RECT {
                     left: i32::from(c.x),
                     top: i32::from(c.y),
@@ -465,6 +480,7 @@ pub fn run(options: Options) -> ExitCode {
         program: options.program.clone(),
         clipboard: options.clipboard,
         attach: options.attach.clone(),
+        packing: options.packing,
         raw_only: false,
     };
     let destination = options.destination.clone();
@@ -655,6 +671,9 @@ impl App {
                 argv: self.settings.program.clone(),
             });
         }
+        self.link.send(Message::Packing {
+            mode: self.settings.packing,
+        });
         if !self.monitors.is_empty() {
             self.link.send(Message::Monitors {
                 monitors: self.monitors.clone(),
@@ -776,7 +795,12 @@ impl App {
             }
             Message::Tile(t) => {
                 if let Some(r) = self.windows.get_mut(&t.window) {
-                    r.pending.push(t);
+                    r.pending.push(Message::Tile(t));
+                }
+            }
+            m @ Message::TileCopy { window, .. } => {
+                if let Some(r) = self.windows.get_mut(&window) {
+                    r.pending.push(m);
                 }
             }
             Message::FrameEnd { window, seq } => {

@@ -1115,3 +1115,133 @@ fn copied_agent_removes_itself_when_done() {
     drop(other);
     let _ = std::fs::remove_dir_all(&bin);
 }
+
+/// Scrolling text: what the client builds from tiles and copies is exactly
+/// what a fresh client gets in full, and scrolls go as copies.
+#[test]
+fn scrolled_picture_matches_a_fresh_one() {
+    use ferostream_client::fb::Framebuffer;
+    use std::collections::HashMap;
+
+    if !need_x() {
+        return;
+    }
+    // Plain text only: no blinking cursor to change the picture under us.
+    let mut a = Agent::start(&["xterm", "-geometry", "60x20", "+bc", "-e", "sh"]);
+    let id = a.until(|m| match m {
+        Message::Session { id, .. } => Some(id),
+        _ => None,
+    });
+    a.send(Message::Packing {
+        mode: ferostream_proto::Packing::Fast,
+    });
+    let mut fbs: HashMap<u32, Framebuffer> = HashMap::new();
+    let mut copies = 0;
+    let mut tile_bytes = 0;
+    let mut window = None;
+    let mut typed = false;
+    // Run until the output has stopped for a while.
+    loop {
+        let Ok(m) =
+            a.rx.recv_timeout(Duration::from_millis(if typed { 1500 } else { 20_000 }))
+        else {
+            assert!(typed, "the agent went quiet");
+            break;
+        };
+        match m {
+            Message::WindowNew {
+                window: w,
+                width,
+                height,
+                kind: WindowKind::Normal,
+                ..
+            } => {
+                fbs.insert(w, Framebuffer::new(width, height));
+                window = Some(w);
+            }
+            Message::WindowConfigure {
+                window: w,
+                width,
+                height,
+                ..
+            } => {
+                if let Some(fb) = fbs.get_mut(&w) {
+                    fb.resize(width, height);
+                }
+            }
+            Message::Tile(t) => {
+                tile_bytes += t.data.len();
+                if let Some(fb) = fbs.get_mut(&t.window) {
+                    assert!(fb.apply(&t).is_some(), "{t:?} does not decode");
+                }
+            }
+            Message::TileCopy {
+                window: w,
+                x,
+                y,
+                width,
+                height,
+                to_x,
+                to_y,
+            } => {
+                copies += 1;
+                let fb = fbs.get_mut(&w).unwrap();
+                assert!(fb.copy(x, y, width, height, to_x, to_y).is_some());
+            }
+            Message::FrameEnd { window: w, seq } => {
+                a.send(Message::FrameAck { window: w, seq });
+                if !typed && Some(w) == window {
+                    typed = true;
+                    a.send(Message::Focus { window: w });
+                    a.send(Message::PointerMove {
+                        window: w,
+                        x: 20,
+                        y: 20,
+                    });
+                    for ch in "for i in $(seq 1 60); do echo line $i; sleep 0.05; done\r".chars() {
+                        a.send(Message::Text { ch });
+                    }
+                }
+            }
+            Message::Error { message } => panic!("agent error: {message}"),
+            _ => {}
+        }
+    }
+    let window = window.unwrap();
+    eprintln!("{copies} copies, {tile_bytes} bytes of tiles");
+    assert!(copies > 0, "no scroll was sent as a copy");
+
+    // A new client gets the whole picture fresh.
+    let runtime = Arc::clone(&a.runtime);
+    let b = Agent::attach(&runtime, Some(&id));
+    let mut fresh: Option<Framebuffer> = None;
+    b.until(|m| match m {
+        Message::WindowNew {
+            window: w,
+            width,
+            height,
+            ..
+        } if w == window => {
+            fresh = Some(Framebuffer::new(width, height));
+            None
+        }
+        Message::Tile(t) if t.window == window => {
+            fresh.as_mut().unwrap().apply(&t);
+            None
+        }
+        Message::FrameEnd { window: w, .. } if w == window => Some(()),
+        _ => None,
+    });
+    let fresh = fresh.unwrap();
+    let kept = &fbs[&window];
+    assert_eq!((kept.width, kept.height), (fresh.width, fresh.height));
+    let differ = kept
+        .pixels
+        .chunks(4)
+        .zip(fresh.pixels.chunks(4))
+        .filter(|(p, q)| p != q)
+        .count();
+    assert_eq!(differ, 0, "{differ} pixels differ from a fresh picture");
+    drop(a);
+    stop_and_check(&runtime, &id);
+}

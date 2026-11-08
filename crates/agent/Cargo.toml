@@ -20,5 +20,8 @@ landlock = "0.4"
 libc = "0.2"
 seccompiler = "0.5"
 
+[dev-dependencies]
+ferostream-client = { path = "../client" }
+
 [lints]
 workspace = true
