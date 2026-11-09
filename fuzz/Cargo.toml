@@ -46,3 +46,10 @@ bench = false
 [profile.release]
 debug = 1
 overflow-checks = true
+
+[[bin]]
+name = "clipboard_pieces"
+path = "fuzz_targets/clipboard_pieces.rs"
+test = false
+doc = false
+bench = false

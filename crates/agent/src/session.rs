@@ -150,6 +150,13 @@ struct State {
     offered: Option<String>,
     /// Clipboard text last sent to the client (not sent again).
     sent_clipboard: Option<String>,
+    /// What the client lets the agent do with text copied on the host
+    /// ([`Message::ClipboardRules`]); nothing until it says.
+    clip_send: bool,
+    clip_selection: bool,
+    /// Copied text arriving in pieces (INCR), while it does, and the
+    /// property it comes through.
+    incr: Option<(xproto::Atom, clipboard::Incr)>,
     /// Monitors the agent set up on the display (RandR names).
     monitors: Vec<xproto::Atom>,
     /// How hard the client wants tiles packed.
@@ -308,6 +315,7 @@ impl Session {
             text_plain_utf8,
             incr,
             property,
+            primary_property,
         ] = c;
         let clip = clipboard::Atoms {
             clipboard,
@@ -319,6 +327,7 @@ impl Session {
             text_plain_utf8,
             incr,
             property,
+            primary_property,
         };
         let screen_size = conn
             .setup()
@@ -350,7 +359,11 @@ impl Session {
             0,
             xproto::WindowClass::INPUT_ONLY,
             0,
-            &xproto::CreateWindowAux::new().override_redirect(1),
+            &xproto::CreateWindowAux::new()
+                .override_redirect(1)
+                // Copied text over ~256 KiB arrives in pieces (INCR), each
+                // announced by a property change.
+                .event_mask(xproto::EventMask::PROPERTY_CHANGE),
         )
         .map_err(err)?;
         // Programs look for a window manager before they ask one to
@@ -382,12 +395,14 @@ impl Session {
             b"FeroStream",
         )
         .map_err(err)?;
-        conn.xfixes_select_selection_input(
-            root,
-            clip.clipboard,
-            xfixes::SelectionEventMask::SET_SELECTION_OWNER,
-        )
-        .map_err(err)?;
+        for sel in [clip.clipboard, clip.primary] {
+            conn.xfixes_select_selection_input(
+                root,
+                sel,
+                xfixes::SelectionEventMask::SET_SELECTION_OWNER,
+            )
+            .map_err(err)?;
+        }
         let keyboard = Keyboard::load(&conn)?;
         conn.sync().map_err(err)?;
         Ok(Arc::new(Session {
@@ -446,6 +461,9 @@ impl Session {
             st.cursor = None;
             // A new client, maybe over another link, with its own setting.
             st.packing = Packing::Auto;
+            st.clip_send = false;
+            st.clip_selection = false;
+            st.incr = None;
             st.link = Link::default();
             for w in st.windows.values_mut() {
                 w.dirty = vec![w.full()];
@@ -617,6 +635,16 @@ impl Session {
             Event::XfixesCursorNotify(e) if lock(&self.state).cursor != Some(e.cursor_serial) => {
                 self.send_cursor()?;
             }
+            Event::PropertyNotify(e)
+                if e.window == self.wake_window
+                    && e.state == xproto::Property::NEW_VALUE
+                    && lock(&self.state)
+                        .incr
+                        .as_ref()
+                        .is_some_and(|i| i.0 == e.atom) =>
+            {
+                self.read_piece(e.atom)?;
+            }
             Event::PropertyNotify(e) if lock(&self.state).windows.contains_key(&e.window) => {
                 if e.atom == self.atoms.net_wm_name
                     || e.atom == u32::from(xproto::AtomEnum::WM_NAME)
@@ -634,24 +662,34 @@ impl Session {
             }
             Event::ClientMessage(e) if e.format == 32 => self.client_message(&e)?,
             Event::XfixesSelectionNotify(e)
-                if e.selection == self.clip.clipboard
-                    && e.owner != self.wake_window
-                    && e.owner != x11rb::NONE =>
+                if e.owner != self.wake_window
+                    && e.owner != x11rb::NONE
+                    && self.wants(e.selection) =>
             {
-                // A program copied: ask it for the text as UTF-8.
+                // A program copied (or, for PRIMARY, selected): ask it for
+                // the text as UTF-8. A transfer still in pieces is dropped.
+                let property = self.clip.property_for(e.selection);
+                {
+                    let mut st = lock(&self.state);
+                    if st.incr.as_ref().is_some_and(|i| i.0 == property) {
+                        st.incr = None;
+                    }
+                }
                 let _ = self.conn.convert_selection(
                     self.wake_window,
-                    self.clip.clipboard,
+                    e.selection,
                     self.clip.utf8_string,
-                    self.clip.property,
+                    property,
                     e.selection_timestamp,
                 );
                 let _ = self.conn.flush();
             }
             Event::SelectionNotify(e)
-                if e.requestor == self.wake_window && e.property == self.clip.property =>
+                if e.requestor == self.wake_window
+                    && (e.property == self.clip.property
+                        || e.property == self.clip.primary_property) =>
             {
-                self.read_copied()?;
+                self.read_copied(e.property)?;
             }
             Event::SelectionRequest(e) if e.owner == self.wake_window => self.give_clipboard(&e),
             Event::SelectionClear(e) if e.selection == self.clip.clipboard => {
@@ -842,15 +880,63 @@ impl Session {
         out
     }
 
+    /// Whether text that goes into `selection` is passed on to the client.
+    fn wants(&self, selection: xproto::Atom) -> bool {
+        let st = lock(&self.state);
+        st.clip_send
+            && (selection == self.clip.clipboard
+                || (selection == self.clip.primary && st.clip_selection))
+    }
+
+    /// Reads one piece of an INCR transfer; the empty piece ends it.
+    fn read_piece(&self, property: xproto::Atom) -> Result<(), String> {
+        // Read and delete the piece (deleting asks the program for the next
+        // one), at most what still fits under the limit, plus one byte to
+        // tell a piece that is too big.
+        let Ok(Ok(r)) = self
+            .conn
+            .get_property(
+                true,
+                self.wake_window,
+                property,
+                xproto::AtomEnum::ANY,
+                0,
+                (ferostream_proto::MAX_CLIPBOARD / 4 + 1) as u32,
+            )
+            .map(|c| c.reply())
+        else {
+            lock(&self.state).incr = None;
+            return Ok(());
+        };
+        let done = {
+            let mut st = lock(&self.state);
+            let Some((_, incr)) = st.incr.as_mut().filter(|i| i.0 == property) else {
+                return Ok(());
+            };
+            match incr.piece(r.format, r.bytes_after, &r.value) {
+                clipboard::Piece::More => None,
+                clipboard::Piece::Done(text) => {
+                    st.incr = None;
+                    Some(text)
+                }
+            }
+        };
+        let _ = self.conn.flush();
+        match done {
+            Some(Some(text)) => self.pass_on(text),
+            _ => Ok(()),
+        }
+    }
+
     /// Reads the text a program handed over after a copy, and passes it on.
-    fn read_copied(&self) -> Result<(), String> {
+    fn read_copied(&self, property: xproto::Atom) -> Result<(), String> {
         let max = (ferostream_proto::MAX_CLIPBOARD / 4) as u32;
         let Ok(Ok(r)) = self
             .conn
             .get_property(
                 true,
                 self.wake_window,
-                self.clip.property,
+                property,
                 xproto::AtomEnum::ANY,
                 0,
                 max,
@@ -859,13 +945,30 @@ impl Session {
         else {
             return Ok(());
         };
-        // INCR is a transfer in pieces, for text over ~256 KiB; such text is
-        // not passed on, and nor is anything that is not 8-bit text.
-        if r.type_ == self.clip.incr || r.format != 8 || r.bytes_after > 0 {
+        // INCR is a transfer in pieces, for text over ~256 KiB: deleting
+        // the property (done by reading it) starts it; each piece then
+        // arrives as a property change ([`Self::read_piece`]). Anything
+        // that is not 8-bit text is not passed on.
+        if r.type_ == self.clip.incr {
+            let mut st = lock(&self.state);
+            if st.clip_send {
+                st.incr = Some((property, clipboard::Incr::default()));
+            }
             return Ok(());
         }
-        let text = String::from_utf8_lossy(&r.value).into_owned();
+        if r.format != 8 || r.bytes_after > 0 {
+            return Ok(());
+        }
+        self.pass_on(String::from_utf8_lossy(&r.value).into_owned())
+    }
+
+    /// Sends text a program copied to the client, unless it is the text
+    /// already sent or the text the client offered.
+    fn pass_on(&self, text: String) -> Result<(), String> {
         let mut st = lock(&self.state);
+        if !st.clip_send {
+            return Ok(());
+        }
         if text.is_empty()
             || st.sent_clipboard.as_deref() == Some(&text)
             || st.offered.as_deref() == Some(&text)
@@ -1289,6 +1392,14 @@ impl Session {
             }
             Message::Packing { mode } => {
                 lock(&self.state).packing = mode;
+            }
+            Message::ClipboardRules { send, selection } => {
+                let mut st = lock(&self.state);
+                st.clip_send = send;
+                st.clip_selection = send && selection;
+                if !send {
+                    st.incr = None;
+                }
             }
             Message::Focus { window } => {
                 let normal = lock(&self.state)

@@ -31,7 +31,7 @@ pub mod tile;
 
 /// Protocol version this crate speaks. Both sides send theirs in
 /// [`Message::Hello`]; a side refuses a version it does not know.
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 
 /// What the agent writes before its first frame.
 pub const PREAMBLE: &[u8] = b"\0FEROSTREAM\n";
@@ -271,6 +271,14 @@ pub enum Message {
     /// How hard the agent packs tiles; sent after [`Message::Start`] or
     /// [`Message::Attach`], and again whenever the user changes it.
     Packing { mode: Packing },
+    /// What the agent may do with text copied on the host; sent after
+    /// [`Message::Start`] or [`Message::Attach`], and again whenever the
+    /// user changes it. Until it arrives the agent sends no
+    /// [`Message::Clipboard`] at all. `send`: pass on text a program copies
+    /// (CLIPBOARD, the Copy command). `selection`: pass on text selected
+    /// with the mouse too (PRIMARY, which xterm and others fill on a plain
+    /// selection); it needs `send`.
+    ClipboardRules { send: bool, selection: bool },
 
     // ----- Agent to client -----
     /// The session is ready: sent first after [`Message::Start`] or
@@ -373,6 +381,7 @@ impl Message {
             Message::Monitors { .. } => 25,
             Message::Attach => 26,
             Message::Packing { .. } => 27,
+            Message::ClipboardRules { .. } => 28,
             Message::Session { .. } => 76,
             Message::WindowNew { .. } => 64,
             Message::WindowConfigure { .. } => 65,
@@ -543,6 +552,10 @@ impl Message {
                 }
             }
             Message::Packing { mode } => w.u8(*mode as u8),
+            Message::ClipboardRules { send, selection } => {
+                w.u8(u8::from(*send));
+                w.u8(u8::from(*selection));
+            }
             Message::Exited { code } => w.i32(*code),
             Message::Error { message } => w.str(message),
             Message::Cursor {
@@ -814,6 +827,10 @@ impl Message {
             }
             27 => Message::Packing {
                 mode: Packing::from_u8(r.u8()?)?,
+            },
+            28 => Message::ClipboardRules {
+                send: r.bool()?,
+                selection: r.bool()?,
             },
             74 => Message::WindowIcon {
                 window: r.u32()?,
@@ -1121,6 +1138,10 @@ mod tests {
             },
             Message::Packing {
                 mode: Packing::Strong,
+            },
+            Message::ClipboardRules {
+                send: true,
+                selection: false,
             },
             Message::Tile(tile::Tile::pack(
                 3,

@@ -44,6 +44,9 @@ options:
   --clipboard WAY  share copied text: both (default), to-host, from-host
                  or off. Text copied on Windows goes to the host when you
                  switch to one of its windows.
+  --share-selection  from the host, pass on text selected with the mouse
+                 too (X PRIMARY: xterm copies that way), not only text
+                 copied with a Copy command
   --packing HOW  how hard the host packs window pictures: auto (default:
                  picked from the measured link speed), fast (LZ4, least
                  CPU) or strong (Deflate, fewest bytes)
@@ -90,22 +93,59 @@ pub struct Clipboard {
     pub to_host: bool,
     /// The host to Windows.
     pub from_host: bool,
+    /// The host to Windows also takes text selected with the mouse (the X
+    /// PRIMARY selection), not only copied text; needs `from_host`.
+    pub selection: bool,
 }
 
 impl Clipboard {
-    fn parse(s: &str) -> Result<Clipboard, String> {
+    /// Copied text both ways; selections stay on the host.
+    pub const BOTH: Clipboard = Clipboard {
+        to_host: true,
+        from_host: true,
+        selection: false,
+    };
+
+    /// The spelling `--clipboard` and FeroSSH's setting use: `both`,
+    /// `to-host`, `from-host` or `off`. `selection` is left off.
+    pub fn from_name(s: &str) -> Option<Clipboard> {
         let (to_host, from_host) = match s {
             "both" => (true, true),
             "to-host" => (true, false),
             "from-host" => (false, true),
             "off" | "none" => (false, false),
-            _ => {
-                return Err(format!(
-                    "--clipboard takes both, to-host, from-host or off, not {s}"
-                ));
-            }
+            _ => return None,
         };
-        Ok(Clipboard { to_host, from_host })
+        Some(Clipboard {
+            to_host,
+            from_host,
+            selection: false,
+        })
+    }
+
+    /// The name for the ways (not the selection).
+    pub fn name(self) -> &'static str {
+        match (self.to_host, self.from_host) {
+            (true, true) => "both",
+            (true, false) => "to-host",
+            (false, true) => "from-host",
+            (false, false) => "off",
+        }
+    }
+
+    /// What the agent is told ([`ferostream_proto::Message::ClipboardRules`]).
+    pub fn rules(self) -> ferostream_proto::Message {
+        ferostream_proto::Message::ClipboardRules {
+            send: self.from_host,
+            selection: self.from_host && self.selection,
+        }
+    }
+}
+
+impl Clipboard {
+    fn parse(s: &str) -> Result<Clipboard, String> {
+        Clipboard::from_name(s)
+            .ok_or_else(|| format!("--clipboard takes both, to-host, from-host or off, not {s}"))
     }
 }
 
@@ -329,10 +369,8 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut install = true;
     let mut install_to: Option<String> = None;
     let mut remove = false;
-    let mut clipboard = Clipboard {
-        to_host: true,
-        from_host: true,
-    };
+    let mut clipboard = Clipboard::BOTH;
+    let mut selection = false;
     let mut packing = Packing::Auto;
     let mut it = args.iter();
     let destination = loop {
@@ -354,6 +392,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--ssh" => ssh = Some(PathBuf::from(value(a)?)),
             "--agent" => agent = Some(value(a)?),
             "--clipboard" => clipboard = Clipboard::parse(&value(a)?)?,
+            "--share-selection" => selection = true,
             "--packing" => {
                 let v = value(a)?;
                 packing = Packing::parse(&v)
@@ -400,7 +439,10 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         destination,
         agent,
         program,
-        clipboard,
+        clipboard: Clipboard {
+            selection,
+            ..clipboard
+        },
         packing,
         attach,
         install,
@@ -590,6 +632,30 @@ mod tests {
         assert!(!o.clipboard.to_host && o.clipboard.from_host);
         let o = parse_args(&args("--clipboard off box")).unwrap().unwrap();
         assert!(!o.clipboard.to_host && !o.clipboard.from_host);
+        assert!(!both.selection);
+        let o = parse_args(&args("--share-selection box")).unwrap().unwrap();
+        assert!(o.clipboard.selection && o.clipboard.from_host);
+        assert_eq!(
+            o.clipboard.rules(),
+            ferostream_proto::Message::ClipboardRules {
+                send: true,
+                selection: true
+            }
+        );
+        // Nothing goes to Windows: the agent is told to send nothing.
+        let o = parse_args(&args("--clipboard to-host --share-selection box"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            o.clipboard.rules(),
+            ferostream_proto::Message::ClipboardRules {
+                send: false,
+                selection: false
+            }
+        );
+        for name in ["both", "to-host", "from-host", "off"] {
+            assert_eq!(Clipboard::from_name(name).unwrap().name(), name);
+        }
     }
 
     fn command_args(c: &Command) -> Vec<String> {

@@ -520,7 +520,9 @@ fn window_manager_requests() {
 /// Not a test of its own: the program [`clipboard_monitors_and_activation`]
 /// runs on the agent's display. It pastes until it gets the text copied
 /// "on Windows", reports the monitors it sees in its title, asks to be
-/// brought to the front, and then copies text of its own.
+/// brought to the front, and then selects text (PRIMARY) and copies a
+/// large text of its own (CLIPBOARD, handed over in INCR pieces). After
+/// that it selects new text every so often.
 #[test]
 #[ignore = "runs inside the agent, started by clipboard_monitors_and_activation"]
 fn helper_clipboard() {
@@ -609,21 +611,84 @@ fn helper_clipboard() {
     )
     .unwrap();
 
-    // Copy, and hand the text to whoever asks.
-    let mine = "from linux ✓";
+    // Select, then copy, and hand the text to whoever asks: the copied
+    // text in 64 KiB pieces.
+    let primary = xproto::Atom::from(xproto::AtomEnum::PRIMARY);
+    let incr = atom("INCR");
+    let mut selected = String::from("selected 0");
+    let copied = helper_copied_text();
+    conn.set_selection_owner(win, primary, x11rb::CURRENT_TIME)
+        .unwrap();
     conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)
         .unwrap();
     conn.flush().unwrap();
-    while let Ok(ev) = conn.wait_for_event() {
+    // The piece transfer under way: requestor, property, bytes sent.
+    let mut sending: Option<(u32, u32, usize)> = None;
+    let mut copy_done = false;
+    let mut n = 0;
+    loop {
+        let Some(ev) = conn.poll_for_event().unwrap() else {
+            std::thread::sleep(Duration::from_millis(20));
+            n += 1;
+            if copy_done && n % 15 == 0 {
+                selected = format!("selected {}", n / 15);
+                conn.set_selection_owner(win, primary, x11rb::CURRENT_TIME)
+                    .unwrap();
+                conn.flush().unwrap();
+            }
+            continue;
+        };
+        if let Event::PropertyNotify(e) = &ev {
+            if let Some((requestor, property, at)) = sending
+                && e.window == requestor
+                && e.atom == property
+                && e.state == xproto::Property::DELETE
+            {
+                let end = (at + 64 * 1024).min(copied.len());
+                conn.change_property8(
+                    xproto::PropMode::REPLACE,
+                    requestor,
+                    property,
+                    utf8,
+                    &copied.as_bytes()[at..end],
+                )
+                .unwrap();
+                conn.flush().unwrap();
+                if at == end {
+                    sending = None;
+                    copy_done = true;
+                } else {
+                    sending = Some((requestor, property, end));
+                }
+            }
+            continue;
+        }
         if let Event::SelectionRequest(e) = ev {
             let ok = e.target == utf8;
-            if ok {
+            if ok && e.selection == clipboard {
+                // Changes to the requestor's property drive the pieces.
+                conn.change_window_attributes(
+                    e.requestor,
+                    &xproto::ChangeWindowAttributesAux::new()
+                        .event_mask(xproto::EventMask::PROPERTY_CHANGE),
+                )
+                .unwrap();
+                conn.change_property32(
+                    xproto::PropMode::REPLACE,
+                    e.requestor,
+                    e.property,
+                    incr,
+                    &[copied.len() as u32],
+                )
+                .unwrap();
+                sending = Some((e.requestor, e.property, 0));
+            } else if ok {
                 conn.change_property8(
                     xproto::PropMode::REPLACE,
                     e.requestor,
                     e.property,
                     utf8,
-                    mine.as_bytes(),
+                    selected.as_bytes(),
                 )
                 .unwrap();
             }
@@ -641,6 +706,16 @@ fn helper_clipboard() {
             conn.flush().unwrap();
         }
     }
+}
+
+/// What [`helper_clipboard`] copies: more than one property can hold at
+/// once, so it goes over in pieces.
+fn helper_copied_text() -> String {
+    let mut t = String::from("from linux ✓ ");
+    while t.len() < 300 * 1024 {
+        t.push_str("0123456789abcdef");
+    }
+    t
 }
 
 #[test]
@@ -681,6 +756,11 @@ fn clipboard_monitors_and_activation() {
             },
         ],
     });
+    // Copies only, not selections, at first.
+    a.send(Message::ClipboardRules {
+        send: true,
+        selection: false,
+    });
     let copied = "from windows — ✓";
     a.send(Message::Clipboard {
         text: copied.into(),
@@ -703,7 +783,19 @@ fn clipboard_monitors_and_activation() {
         title.unwrap(),
         format!("pasted {} monitors=2", copied.len())
     );
-    assert_eq!(clip.unwrap(), "from linux ✓");
+    // The selection made before the copy was not passed on: the large
+    // copied text was the first to come.
+    assert_eq!(clip.unwrap(), helper_copied_text());
+
+    // Selections too, now.
+    a.send(Message::ClipboardRules {
+        send: true,
+        selection: true,
+    });
+    a.until(|m| match m {
+        Message::Clipboard { text } if text.starts_with("selected ") => Some(()),
+        _ => None,
+    });
     drop(a.child.stdin.take());
     let _ = a.child.wait();
 }

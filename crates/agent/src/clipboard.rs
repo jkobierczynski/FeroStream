@@ -1,6 +1,7 @@
 //! The X side of the clipboard: what the agent offers when a program
 //! pastes text copied on Windows, and how it reads text a program copied.
-//! The helpers here are pure, so they are tested without an X server.
+//! The helpers here are pure, so they are tested without an X server (and
+//! fuzzed: `fuzz/fuzz_targets/clipboard_pieces.rs`).
 
 /// Atoms the clipboard uses.
 #[derive(Debug, Clone, Copy)]
@@ -13,13 +14,28 @@ pub struct Atoms {
     pub text: u32,
     pub text_plain_utf8: u32,
     pub incr: u32,
-    /// Where a program puts the text the agent asked it for.
+    /// Where a program puts the CLIPBOARD text the agent asked it for.
     pub property: u32,
+    /// Where it puts PRIMARY text: a property of its own, so a selection
+    /// and a copy made together do not land on each other.
+    pub primary_property: u32,
+}
+
+impl Atoms {
+    /// The property text from `selection` is fetched into.
+    pub fn property_for(&self, selection: u32) -> u32 {
+        if selection == self.primary {
+            self.primary_property
+        } else {
+            self.property
+        }
+    }
 }
 
 /// Names for [`Atoms`] except PRIMARY and STRING (predefined), in order:
-/// clipboard, targets, utf8_string, text, text_plain_utf8, incr, property.
-pub const ATOM_NAMES: [&[u8]; 7] = [
+/// clipboard, targets, utf8_string, text, text_plain_utf8, incr, property,
+/// primary_property.
+pub const ATOM_NAMES: [&[u8]; 8] = [
     b"CLIPBOARD",
     b"TARGETS",
     b"UTF8_STRING",
@@ -27,6 +43,7 @@ pub const ATOM_NAMES: [&[u8]; 7] = [
     b"text/plain;charset=utf-8",
     b"INCR",
     b"_FEROSTREAM_SELECTION",
+    b"_FEROSTREAM_PRIMARY",
 ];
 
 /// What goes into the property a pasting program reads.
@@ -65,8 +82,54 @@ pub fn answer(a: &Atoms, target: u32, text: &str) -> Option<(u32, Data)> {
     None
 }
 
+/// Copied text a program hands over in pieces (INCR): what has come so
+/// far. Text over [`ferostream_proto::MAX_CLIPBOARD`], or that is not 8-bit
+/// text, is read to the end (the program waits for that) and then dropped.
+#[derive(Debug, Default)]
+pub struct Incr {
+    text: Vec<u8>,
+    dropped: bool,
+}
+
+/// What one INCR piece leaves.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Piece {
+    /// More pieces follow.
+    More,
+    /// That was the last (empty) piece: the text, unless it was dropped.
+    Done(Option<String>),
+}
+
+impl Incr {
+    /// Takes one piece: its property format, the bytes left unread after
+    /// it and its bytes.
+    pub fn piece(&mut self, format: u8, bytes_after: u32, value: &[u8]) -> Piece {
+        if value.is_empty() && bytes_after == 0 {
+            let text = std::mem::take(&mut self.text);
+            return Piece::Done(
+                (!self.dropped).then(|| String::from_utf8_lossy(&text).into_owned()),
+            );
+        }
+        if self.dropped {
+            return Piece::More;
+        }
+        if format != 8
+            || bytes_after > 0
+            || self.text.len() + value.len() > ferostream_proto::MAX_CLIPBOARD
+        {
+            self.dropped = true;
+            self.text = Vec::new();
+            return Piece::More;
+        }
+        self.text.extend_from_slice(value);
+        Piece::More
+    }
+}
+
+/// The predefined ATOM atom (kept as a number so this file builds without
+/// x11rb, for the fuzz target).
 fn xproto_atom() -> u32 {
-    x11rb::protocol::xproto::AtomEnum::ATOM.into()
+    4
 }
 
 /// A point on a `width` x `height` screen that none of `windows` (x, y,
@@ -116,6 +179,7 @@ mod tests {
             text_plain_utf8: 104,
             incr: 105,
             property: 106,
+            primary_property: 107,
         }
     }
 
@@ -132,6 +196,39 @@ mod tests {
         assert_eq!(ty, 4);
         assert!(matches!(d, Data::Atoms(l) if l.len() == 5));
         assert!(answer(&a, 999, "x").is_none());
+    }
+
+    #[test]
+    fn pieces() {
+        let mut i = Incr::default();
+        assert_eq!(i.piece(8, 0, "héllo ".as_bytes()), Piece::More);
+        assert_eq!(i.piece(8, 0, b"world"), Piece::More);
+        assert_eq!(i.piece(8, 0, b""), Piece::Done(Some("héllo world".into())));
+
+        // Over the limit: read to the end, then dropped.
+        let mut i = Incr::default();
+        let big = vec![b'x'; ferostream_proto::MAX_CLIPBOARD / 2 + 1];
+        assert_eq!(i.piece(8, 0, &big), Piece::More);
+        assert_eq!(i.piece(8, 0, &big), Piece::More);
+        assert_eq!(i.piece(8, 0, b"y"), Piece::More);
+        assert_eq!(i.piece(8, 0, b""), Piece::Done(None));
+
+        // Exactly the limit is fine.
+        let mut i = Incr::default();
+        let half = vec![b'x'; ferostream_proto::MAX_CLIPBOARD / 2];
+        i.piece(8, 0, &half);
+        i.piece(8, 0, &half);
+        assert!(
+            matches!(i.piece(8, 0, b""), Piece::Done(Some(t)) if t.len() == ferostream_proto::MAX_CLIPBOARD)
+        );
+
+        // Not 8-bit text, or a piece left half read.
+        let mut i = Incr::default();
+        assert_eq!(i.piece(32, 0, &[0; 8]), Piece::More);
+        assert_eq!(i.piece(8, 0, b""), Piece::Done(None));
+        let mut i = Incr::default();
+        assert_eq!(i.piece(8, 10, b"abc"), Piece::More);
+        assert_eq!(i.piece(8, 0, b""), Piece::Done(None));
     }
 
     #[test]
