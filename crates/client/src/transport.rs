@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ferostream_proto::is_session_id;
+use ferostream_proto::{Packing, is_session_id};
 
 /// Usage text, shown for `--help` and for a bad command line.
 pub const USAGE: &str = "\
@@ -44,6 +44,9 @@ options:
   --clipboard WAY  share copied text: both (default), to-host, from-host
                  or off. Text copied on Windows goes to the host when you
                  switch to one of its windows.
+  --packing HOW  how hard the host packs window pictures: auto (default:
+                 picked from the measured link speed), fast (LZ4, least
+                 CPU) or strong (Deflate, fewest bytes)
   -h, --help     this text";
 
 /// What the command line asked for.
@@ -59,6 +62,8 @@ pub struct Options {
     /// shell).
     pub program: Vec<String>,
     pub clipboard: Clipboard,
+    /// How hard the agent packs pixels.
+    pub packing: Packing,
     /// A new session, or one to take over.
     pub attach: AttachTo,
     /// Copy the agent to the host when it is missing or different.
@@ -328,6 +333,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         to_host: true,
         from_host: true,
     };
+    let mut packing = Packing::Auto;
     let mut it = args.iter();
     let destination = loop {
         let Some(a) = it.next() else {
@@ -348,6 +354,11 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--ssh" => ssh = Some(PathBuf::from(value(a)?)),
             "--agent" => agent = Some(value(a)?),
             "--clipboard" => clipboard = Clipboard::parse(&value(a)?)?,
+            "--packing" => {
+                let v = value(a)?;
+                packing = Packing::parse(&v)
+                    .ok_or_else(|| format!("--packing takes auto, fast or strong, not {v}"))?;
+            }
             "--no-install" => install = false,
             "--install-to" => install_to = Some(value(a)?),
             "--remove-agent" => remove = true,
@@ -390,6 +401,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         agent,
         program,
         clipboard,
+        packing,
         attach,
         install,
     }))
@@ -557,6 +569,15 @@ mod tests {
             .unwrap();
         assert_eq!(o.place, Place::new("~/t/fa", true).unwrap());
         assert!(parse_args(&args("--install-to rel/fa box")).is_err());
+    }
+
+    #[test]
+    fn packing() {
+        let o = parse_args(&args("box")).unwrap().unwrap();
+        assert_eq!(o.packing, Packing::Auto);
+        let o = parse_args(&args("--packing strong box")).unwrap().unwrap();
+        assert_eq!(o.packing, Packing::Strong);
+        assert!(parse_args(&args("--packing hard box")).is_err());
     }
 
     #[test]

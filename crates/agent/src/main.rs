@@ -19,6 +19,8 @@ mod scale;
 #[cfg(unix)]
 mod session;
 #[cfg(unix)]
+mod shadow;
+#[cfg(unix)]
 mod wm;
 #[cfg(unix)]
 mod xserver;

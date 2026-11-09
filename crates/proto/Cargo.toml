@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 lz4_flex.workspace = true
+miniz_oxide.workspace = true
 
 [lints]
 workspace = true

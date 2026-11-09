@@ -31,7 +31,7 @@ pub mod tile;
 
 /// Protocol version this crate speaks. Both sides send theirs in
 /// [`Message::Hello`]; a side refuses a version it does not know.
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 
 /// What the agent writes before its first frame.
 pub const PREAMBLE: &[u8] = b"\0FEROSTREAM\n";
@@ -152,6 +152,50 @@ impl WindowState {
     }
 }
 
+/// How hard the agent packs tiles ([`Message::Packing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Packing {
+    /// The agent picks from the link speed it measures: LZ4 on a fast link,
+    /// Deflate on a slow one.
+    #[default]
+    Auto = 0,
+    /// Always LZ4: least CPU on both ends.
+    Fast = 1,
+    /// Always Deflate: fewest bytes.
+    Strong = 2,
+}
+
+impl Packing {
+    fn from_u8(v: u8) -> Result<Self, Error> {
+        match v {
+            0 => Ok(Packing::Auto),
+            1 => Ok(Packing::Fast),
+            2 => Ok(Packing::Strong),
+            _ => Err(Error::Invalid("packing")),
+        }
+    }
+
+    /// The command-line spelling: `auto`, `fast` or `strong`.
+    pub fn parse(s: &str) -> Option<Packing> {
+        match s {
+            "auto" => Some(Packing::Auto),
+            "fast" => Some(Packing::Fast),
+            "strong" => Some(Packing::Strong),
+            _ => None,
+        }
+    }
+
+    /// The command-line spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Packing::Auto => "auto",
+            Packing::Fast => "fast",
+            Packing::Strong => "strong",
+        }
+    }
+}
+
 /// One message, either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -224,6 +268,9 @@ pub enum Message {
     /// agent answers with [`Message::Session`] and then announces every
     /// window again, as if new, with its pixels.
     Attach,
+    /// How hard the agent packs tiles; sent after [`Message::Start`] or
+    /// [`Message::Attach`], and again whenever the user changes it.
+    Packing { mode: Packing },
 
     // ----- Agent to client -----
     /// The session is ready: sent first after [`Message::Start`] or
@@ -284,6 +331,19 @@ pub enum Message {
     },
     /// New pixels for a rectangle of a window; see [`tile`].
     Tile(tile::Tile),
+    /// Pixels the client already has moved within a window (a scroll):
+    /// the `width` x `height` rectangle at `x`,`y` is copied to `to_x`,`to_y`,
+    /// as if read whole before any is written. Part of the frame, in order
+    /// with its tiles. Both rectangles lie inside the window.
+    TileCopy {
+        window: u32,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        to_x: u16,
+        to_y: u16,
+    },
     /// The tiles sent so far for `window` make a whole picture; draw it and
     /// answer with [`Message::FrameAck`].
     FrameEnd { window: u32, seq: u32 },
@@ -312,6 +372,7 @@ impl Message {
             Message::Focus { .. } => 24,
             Message::Monitors { .. } => 25,
             Message::Attach => 26,
+            Message::Packing { .. } => 27,
             Message::Session { .. } => 76,
             Message::WindowNew { .. } => 64,
             Message::WindowConfigure { .. } => 65,
@@ -325,6 +386,7 @@ impl Message {
             Message::WindowHints { .. } => 73,
             Message::WindowIcon { .. } => 74,
             Message::WindowActivate { .. } => 75,
+            Message::TileCopy { .. } => 77,
         }
     }
 
@@ -466,6 +528,21 @@ impl Message {
                 w.u8(t.encoding as u8);
                 w.bytes(&t.data);
             }
+            Message::TileCopy {
+                window,
+                x,
+                y,
+                width,
+                height,
+                to_x,
+                to_y,
+            } => {
+                w.u32(*window);
+                for v in [x, y, width, height, to_x, to_y] {
+                    w.u16(*v);
+                }
+            }
+            Message::Packing { mode } => w.u8(*mode as u8),
             Message::Exited { code } => w.i32(*code),
             Message::Error { message } => w.str(message),
             Message::Cursor {
@@ -703,6 +780,41 @@ impl Message {
                 }
             }
             75 => Message::WindowActivate { window: r.u32()? },
+            77 => {
+                let m = Message::TileCopy {
+                    window: r.u32()?,
+                    x: r.u16()?,
+                    y: r.u16()?,
+                    width: r.side()?,
+                    height: r.side()?,
+                    to_x: r.u16()?,
+                    to_y: r.u16()?,
+                };
+                if let Message::TileCopy {
+                    x,
+                    y,
+                    width,
+                    height,
+                    to_x,
+                    to_y,
+                    ..
+                } = m
+                {
+                    let fits =
+                        |a: u16, n: u16| u32::from(a) + u32::from(n) <= u32::from(MAX_WINDOW_SIDE);
+                    if !(fits(x, width)
+                        && fits(y, height)
+                        && fits(to_x, width)
+                        && fits(to_y, height))
+                    {
+                        return Err(Error::Invalid("copy geometry"));
+                    }
+                }
+                m
+            }
+            27 => Message::Packing {
+                mode: Packing::from_u8(r.u8()?)?,
+            },
             74 => Message::WindowIcon {
                 window: r.u32()?,
                 big: r.bool()?,
@@ -998,6 +1110,27 @@ mod tests {
             Message::WindowGone { window: 3 },
             Message::Tile(tile::Tile::lz4(3, 0, 0, 2, 2, &[9; 16])),
             Message::FrameEnd { window: 3, seq: 9 },
+            Message::TileCopy {
+                window: 3,
+                x: 0,
+                y: 10,
+                width: 100,
+                height: 50,
+                to_x: 0,
+                to_y: 0,
+            },
+            Message::Packing {
+                mode: Packing::Strong,
+            },
+            Message::Tile(tile::Tile::pack(
+                3,
+                0,
+                0,
+                4,
+                4,
+                &[1; 64],
+                tile::Effort::Strong,
+            )),
             Message::Cursor {
                 hot_x: 3,
                 hot_y: 4,

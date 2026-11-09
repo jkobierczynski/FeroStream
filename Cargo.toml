@@ -12,6 +12,7 @@ repository = "https://github.com/jkobierczynski/ferostream"
 
 [workspace.dependencies]
 ferostream-proto = { path = "crates/proto", version = "0.1.0" }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode", "std"] }
 
 [workspace.lints.rust]
