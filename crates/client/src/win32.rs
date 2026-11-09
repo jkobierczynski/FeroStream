@@ -246,6 +246,8 @@ struct App {
     cursor: Option<HCURSOR>,
     /// Which ways copied text may travel.
     clipboard: Clipboard,
+    /// Hello went over the current link (so other messages may follow).
+    greeted: bool,
     /// Windows clipboard sequence number when we last looked at it or
     /// wrote it ourselves.
     clip_seq: u32,
@@ -375,6 +377,7 @@ pub fn start(settings: Settings, mut host: Box<dyn Host>) -> Result<u32, String>
         high_surrogate: None,
         cursor: None,
         clipboard,
+        greeted: false,
         clip_seq: 0,
         last_clip: None,
         monitors: screens,
@@ -402,6 +405,24 @@ pub fn stop(session: u32) {
     if let Some(app) = app {
         app.close_windows();
     }
+}
+
+/// Changes which ways copied text travels for session `session`, at once:
+/// the agent hears it, and the client stops (or starts) passing text on.
+pub fn set_clipboard(session: u32, clipboard: Clipboard) {
+    APPS.with(|a| {
+        if let Ok(mut a) = a.try_borrow_mut()
+            && let Some(app) = a.get_mut(&session)
+        {
+            app.clipboard = clipboard;
+            // Text copied on Windows while sharing was off is not sent now
+            // it is on: only what is copied from here on.
+            app.clip_seq = clip::sequence();
+            if app.greeted {
+                app.link.send(clipboard.rules());
+            }
+        }
+    });
 }
 
 /// The sessions running on this thread.
@@ -624,6 +645,7 @@ impl App {
             Ok(link) => {
                 self.link = link;
                 self.link_number = number;
+                self.greeted = false;
             }
             Err(_) => self.lost(),
         }
@@ -652,6 +674,7 @@ impl App {
             version: VERSION,
             software: SOFTWARE.into(),
         });
+        self.greeted = true;
         if self.session.is_some() || self.settings.attach != AttachTo::New {
             self.link.send(Message::Attach);
         } else {
@@ -674,6 +697,7 @@ impl App {
         self.link.send(Message::Packing {
             mode: self.settings.packing,
         });
+        self.link.send(self.clipboard.rules());
         if !self.monitors.is_empty() {
             self.link.send(Message::Monitors {
                 monitors: self.monitors.clone(),

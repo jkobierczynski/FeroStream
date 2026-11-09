@@ -51,9 +51,14 @@ lines in xterm took 459 KB with plain LZ4 tiles. Now it takes 26 KB with
 
 Copied text: what a program copies lands on the Windows clipboard; what you
 copy on Windows reaches the host when you switch to one of its windows
-(Ctrl+V in programs, and middle click or Shift+Insert in xterm).
+(Ctrl+V in programs, and middle click or Shift+Insert in xterm). Text is up
+to 1 MiB either way, large copies included. Only text is shared.
 `--clipboard to-host`, `from-host` or `off` limits that, for example for a
-host you trust less.
+host you trust less; with `to-host` or `off` the agent sends nothing it
+sees copied. Text you only select with the mouse (xterm's way of copying,
+the X "PRIMARY" selection) stays on the host unless you add
+`--share-selection`: otherwise every selection would replace the Windows
+clipboard.
 
 Typing goes through your Windows keyboard layout: the client sends the
 characters Windows produces (dead keys and AltGr included), so the host
