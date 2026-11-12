@@ -37,11 +37,13 @@ jobs:
       # The agents build on Windows too, with no WSL or C toolchain:
       # .cargo/config.toml links them with rust-lld. This keeps the
       # instructions in the README true.
-      - name: Build the Linux agents on Windows
-        run: |
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
-          cargo build --release --locked -p ferostream-agent --target aarch64-unknown-linux-musl
+      # One command per step: pwsh would not stop after a failed native
+      # command, so a failed x86-64 build could hide behind the ARM64 one.
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - name: Build the x86-64 Linux agent on Windows
+        run: cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
+      - name: Build the ARM64 Linux agent on Windows
+        run: cargo build --release --locked -p ferostream-agent --target aarch64-unknown-linux-musl
 
   linux:
     name: Agent against Xvfb (Linux)
