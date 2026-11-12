@@ -1,0 +1,105 @@
+name: Release
+
+# Pushing a version tag such as v0.2.0 runs every CI check and publishes a
+# GitHub Release with ferostream.exe, the two Linux agents, their SHA-256
+# sums and the notes from docs/releases/<tag>.md. The files and the sums get
+# signed build provenance attestations. A tag with a hyphen (v0.3.0-rc1)
+# makes a pre-release. ferostream.exe is not code signed yet.
+#
+# Tag with git on your PC and push the tag (git tag v0.2.0 && git push
+# origin v0.2.0); a tag made in the GitHub web page does the same, but a
+# release made there first does not run this workflow.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  # A dry run from the Actions tab: every step except the attestation and
+  # the GitHub Release, whose files are uploaded as a workflow artifact.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the tag with the workspace version and look for notes
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "v$version" != "${tag%%-*}" ]; then
+            echo "::error::Tag $tag does not match the workspace version $version in Cargo.toml"
+            exit 1
+          fi
+          if [ ! -f "docs/releases/$tag.md" ]; then
+            echo "::error::docs/releases/$tag.md is missing; the release notes come from there"
+            exit 1
+          fi
+
+  # The same jobs as on a pull request. They upload ferostream.exe and the
+  # agents.
+  ci:
+    name: CI
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish the release
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Build provenance attestations, signed through GitHub's Sigstore
+      # instance with this workflow's identity.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferostream-exe
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferostream-agents
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: |
+          chmod 755 ferostream-agent ferostream-agent-aarch64
+          sha256sum ferostream.exe ferostream-agent ferostream-agent-aarch64 > SHA256SUMS.txt
+          cat SHA256SUMS.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Verify with: gh attestation verify ferostream.exe -R jkobierczynski/FeroStream
+      - uses: actions/attest-build-provenance@v2
+        if: github.event_name == 'push'
+        with:
+          subject-path: |
+            dist/ferostream.exe
+            dist/ferostream-agent
+            dist/ferostream-agent-aarch64
+            dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'push'
+        with:
+          name: release-dry-run
+          path: dist
+
+      - name: Publish
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          pre=()
+          case "$TAG" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$TAG" "${pre[@]}" \
+            --title "FeroStream ${TAG#v}" \
+            --notes-file "docs/releases/$TAG.md" \
+            --verify-tag \
+            dist/ferostream.exe dist/ferostream-agent dist/ferostream-agent-aarch64 dist/SHA256SUMS.txt

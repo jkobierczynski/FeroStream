@@ -34,6 +34,14 @@ jobs:
         with:
           name: ferostream-exe
           path: target/release/ferostream.exe
+      # The agents build on Windows too, with no WSL or C toolchain:
+      # .cargo/config.toml links them with rust-lld. This keeps the
+      # instructions in the README true.
+      - name: Build the Linux agents on Windows
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
+          cargo build --release --locked -p ferostream-agent --target aarch64-unknown-linux-musl
 
   linux:
     name: Agent against Xvfb (Linux)
@@ -48,24 +56,28 @@ jobs:
       - run: cargo test --workspace --locked
         env:
           FEROSTREAM_REQUIRE_X: "1"
-      # One static binary that runs on any x86-64 Linux.
+      # One static binary that runs on any x86-64 Linux, and one for 64-bit
+      # ARM (Raspberry Pi OS, Graviton). rust-lld links both (see
+      # .cargo/config.toml): no C toolchain for the target needed.
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       - run: cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
-      # And one for 64-bit ARM (Raspberry Pi OS, Graviton), linked by
-      # rust-lld: no cross C toolchain needed.
-      - run: rustup target add aarch64-unknown-linux-musl
       - run: cargo build --release --locked -p ferostream-agent --target aarch64-unknown-linux-musl
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
-      - name: Report agent size
+      # Named as the client looks for them next to its exe: plain for
+      # x86-64, with `uname -m` appended for other machines.
+      - name: Collect and report the agents
         run: |
-          size=$(stat -c %s target/x86_64-unknown-linux-musl/release/ferostream-agent)
-          echo "ferostream-agent (static, musl): $((size / 1024)) KB" | tee -a "$GITHUB_STEP_SUMMARY"
+          mkdir agents
+          cp target/x86_64-unknown-linux-musl/release/ferostream-agent agents/ferostream-agent
+          cp target/aarch64-unknown-linux-musl/release/ferostream-agent agents/ferostream-agent-aarch64
+          for f in agents/*; do
+            echo "$(basename "$f") (static, musl): $(( $(stat -c %s "$f") / 1024 )) KB" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: ferostream-agent-linux-x86_64
-          path: target/x86_64-unknown-linux-musl/release/ferostream-agent
+          name: ferostream-agents
+          path: agents
 
-  # The exe and the agent it copies to hosts, in one download.
+  # The exe and the agents it copies to hosts, in one download.
   package:
     name: Windows package
     needs: [windows, linux]
@@ -77,7 +89,7 @@ jobs:
           path: package
       - uses: actions/download-artifact@v4
         with:
-          name: ferostream-agent-linux-x86_64
+          name: ferostream-agents
           path: package
       - run: ls -l package
       - uses: actions/upload-artifact@v4

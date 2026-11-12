@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ferostream-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ferostream-client",
  "ferostream-proto",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "ferostream-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ferostream-proto",
  "windows",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "ferostream-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lz4_flex",
  "miniz_oxide",
