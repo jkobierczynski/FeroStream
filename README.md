@@ -13,7 +13,7 @@ FeroStream is a pair of small Rust programs:
 | Part | Runs on | What it is |
 | --- | --- | --- |
 | `ferostream.exe` | Windows | Native Win32 client, no toolkit, no installer |
-| `ferostream-agent` | Linux | One static binary (about 650 KB), no root, no daemon |
+| `ferostream-agent` | Linux | One static binary (about 850 KB), no root, no daemon |
 
 The client starts the agent through your normal OpenSSH (`ssh.exe`), so
 logins, keys, `~/.ssh/config`, jump hosts and host-key checks all work as they
@@ -22,7 +22,8 @@ only pixels; the client sends only input. Nothing listens on the network.
 
 The protocol lives in its own crate, [`ferostream-proto`](crates/proto), so
 other clients and SSH tools can integrate it. [FeroSSH](https://github.com/jkobierczynski/FeroSSH)
-will.
+does: its Session > Remote apps runs programs this way over the pane's own SSH
+connection (see [Embedding the client](#embedding-the-client)).
 
 ## Status
 
@@ -73,8 +74,11 @@ On the Linux host, install Xvfb:
 sudo apt install xvfb                      # Fedora: xorg-x11-server-Xvfb
 ```
 
-On Windows, keep `ferostream-agent` next to `ferostream.exe` (the
-`ferostream-windows-x64` CI artifact has both) and run:
+On Windows, download `ferostream.exe`, `ferostream-agent` and
+`ferostream-agent-aarch64` from the [latest
+release](https://github.com/jkobierczynski/FeroStream/releases/latest) (or
+the `ferostream-windows-x64` artifact of a CI run, which has all three),
+keep them in one folder and run:
 
 ```
 ferostream.exe [-p PORT] [-i KEY] [-J JUMP] [user@]host [program [args...]]
@@ -160,11 +164,70 @@ a separate sandboxed process while the window side accepts only raw tiles
 
 ## Building
 
+`rust-toolchain.toml` pins the Rust version, and rustup installs it with the
+targets below by itself.
+
 ```
 cargo test --workspace                        # Linux: also runs xterm under Xvfb
-cargo build --release -p ferostream-client    # Windows
-cargo build --release -p ferostream-agent --target x86_64-unknown-linux-musl
+cargo build --release -p ferostream-client    # Windows: target\release\ferostream.exe
 ```
+
+### The agents
+
+The agent is a Linux program, built as one static musl binary per CPU type.
+Every dependency is pure Rust and `.cargo/config.toml` links it with
+`rust-lld`, which comes with Rust, so the same commands work on Linux, WSL,
+macOS and plain Windows (PowerShell or cmd), with no C compiler, cross
+toolchain or WSL:
+
+```
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ferostream-agent --target aarch64-unknown-linux-musl
+```
+
+They land in `target/x86_64-unknown-linux-musl/release/ferostream-agent`
+and `target/aarch64-unknown-linux-musl/release/ferostream-agent`. Put them
+next to `ferostream.exe` (or `ferossh.exe`) as `ferostream-agent` and
+`ferostream-agent-aarch64`: the client picks one by the host's `uname -m`
+(plain `ferostream-agent` for `x86_64`, `ferostream-agent-<uname -m>` for
+any other) and copies it over. A host of another kind needs an agent built
+for its target, named the same way.
+
+Before v0.2.0 the repository had no `.cargo/config.toml`, and on Windows
+the build stopped with ``linker `cc` not found``. To build an older commit
+there (FeroSSH pins one in its `Cargo.lock`), set the linker yourself
+first, in PowerShell:
+
+```
+$env:CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "rust-lld"
+$env:CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = "rust-lld"
+```
+
+(cmd: `set CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld`, and the
+same for AARCH64; Linux and WSL: `export ...=rust-lld`.)
+
+**For FeroSSH you normally do not build them.** FeroSSH's CI builds both
+agents from the FeroStream commit its `Cargo.lock` pins, so they speak the
+same protocol as the client inside `ferossh.exe`, and every FeroSSH release
+has them next to the exe. To build them by hand for a FeroSSH build, check
+out that pinned commit (the `rev` in FeroSSH's `Cargo.toml`), not `main`.
+
+CI builds the agents on Linux and, to keep the instructions above true, on
+Windows too. Its `ferostream-agents` artifact holds both, named for the
+client.
+
+### Releases
+
+Pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`) runs
+[`release.yml`](.github/workflows/release.yml): it checks that the tag
+matches the version in `Cargo.toml` and that `docs/releases/<tag>.md`
+exists, runs every CI job, and publishes `ferostream.exe`,
+`ferostream-agent`, `ferostream-agent-aarch64` and `SHA256SUMS.txt` with
+those notes. The files and the sums get build provenance attestations:
+`gh attestation verify ferostream.exe -R jkobierczynski/FeroStream` checks a
+download. `ferostream.exe` is not code signed yet. Run the workflow by hand
+from the Actions tab for a dry run.
 
 ## Licence
 
